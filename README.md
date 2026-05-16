@@ -1,97 +1,169 @@
-# BDAG Kepler GPU Miner
+# BDAG GPU Miner
 
-Experimental NVIDIA CUDA GPU miner for connecting to a BlockDAG-compatible stratum pool.
+Experimental CUDA GPU miner for the BlockDAG network.
 
-This release is intended for testers. It is not financial advice, has no warranty, and may produce different results depending on GPU model, driver, CUDA version, pool difficulty, and network conditions.
+This miner is designed for Linux machines with NVIDIA GPUs. It has been tested on a fresh Vast.ai GPU instance using an RTX 3060.
+
+## What this does
+
+This miner connects to a BlockDAG mining pool, receives mining jobs, scans nonces using a CUDA GPU, and submits valid shares back to the pool.
+
+The miner is configured using a simple `.env` file, so users do not need to edit the source code to change their wallet or pool settings.
 
 ## Requirements
 
-- Linux x86_64
+You need:
+
+- Linux / Ubuntu GPU server
 - NVIDIA GPU
-- NVIDIA driver installed
-- CUDA toolkit with `nvcc` available if building from source
-- OpenSSL development libraries
+- NVIDIA drivers
+- CUDA toolkit / `nvcc`
+- `git`
+- `make`
+- Internet access
+- A BlockDAG-compatible wallet address starting with `0x`
 
-On Ubuntu/Debian, the common build dependency is:
-
-```bash
-sudo apt update
-sudo apt install -y build-essential libssl-dev
-```
-
-Install the NVIDIA driver and CUDA toolkit using the appropriate method for your host or rental provider.
+This is intended for GPU VPS platforms such as Vast.ai, RunPod, or your own CUDA Linux machine.
 
 ## Quick start
 
+Clone the repo:
+
 ```bash
-git clone <YOUR_REPO_URL_HERE>
-cd bdag-kepler-gpu-miner
+git clone https://github.com/loftedplacebo/bdag-gpu-miner.git
+cd bdag-gpu-miner
+
+Create your local environment file:
+
 cp .env.example .env
 nano .env
+
+Edit your wallet address:
+
+WALLET=0xYourWalletAddressHere
+
+Then build and run:
+
+chmod +x build.sh run.sh run_my_pool.sh
 ./build.sh
 ./run.sh
-```
+Configuration
 
-The first time you run `./run.sh`, it will create `.env` automatically if it does not already exist. You must edit `.env` and replace the placeholder wallet before mining.
+All user settings are controlled through .env.
 
-## Configuration
+Example:
 
-Edit `.env`:
-
-```bash
 POOL_HOST=62.171.161.32
 POOL_PORT=3334
 WALLET=0xYourWalletAddressHere
-PASSWORD=x
-RUNTIME_SECONDS=600
-SUBMIT_MARGIN=1.02
-MIN_SUBMIT_THRESHOLD=0.25
-EXTRANONCE2_HEX=00000000
-```
+WORKER_NAME=gpu01
+RUNTIME_SECONDS=300
+MARGIN=0.99
+MIN_THRESHOLD=0.01
+Settings explained
+Setting	Description
+POOL_HOST	Mining pool hostname or IP address
+POOL_PORT	Mining pool stratum port
+WALLET	Your BlockDAG-compatible wallet address
+WORKER_NAME	Optional worker name for identifying your GPU
+RUNTIME_SECONDS	How long the miner should run before stopping
+MARGIN	Share threshold margin
+MIN_THRESHOLD	Minimum share threshold
+Wallet setup
 
-### Important fields
+Your wallet should be an EVM-style address:
 
-| Field | Purpose |
-|---|---|
-| `POOL_HOST` | Mining pool host or IP address |
-| `POOL_PORT` | Mining pool stratum port |
-| `WALLET` | Your payout wallet address |
-| `RUNTIME_SECONDS` | How long the miner runs before exiting |
-| `SUBMIT_MARGIN` | Share submission safety margin |
-| `MIN_SUBMIT_THRESHOLD` | Minimum share threshold used by the miner |
+0x0000000000000000000000000000000000000000
 
-The wallet must be a 42-character EVM-style address beginning with `0x`.
+The miner will reject obviously invalid wallet values.
 
-## Build
+Do not edit the source code to change wallet details. Edit .env only.
 
-```bash
+Tested Vast.ai setup
+
+A simple first test can be done using:
+
+1× RTX 3060
+Ubuntu 22.04
+CUDA image
+Fresh instance
+
+Example setup commands:
+
+cd /workspace || cd /root
+git clone https://github.com/loftedplacebo/bdag-gpu-miner.git
+cd bdag-gpu-miner
+
+cp .env.example .env
+nano .env
+
+chmod +x build.sh run.sh run_my_pool.sh
 ./build.sh
-```
-
-The current build script targets `sm_86`. If your GPU uses a different architecture, edit `build.sh` and change the `--gpu-architecture` value.
-
-Common examples:
-
-| GPU family | CUDA arch example |
-|---|---|
-| RTX 30 series | `sm_86` |
-| RTX 40 series | `sm_89` |
-| Older Tesla/Kepler | may require older CUDA/toolchain support |
-
-## Run
-
-```bash
 ./run.sh
-```
+Checking your GPU
 
-The script prints the pool and a shortened wallet address before starting so you can confirm you are mining to the correct wallet.
+Before building, check that the GPU is visible:
 
-## Security notes
+nvidia-smi
 
-- Do not commit your `.env` file.
-- Do not put private keys, seed phrases, exchange API keys, or VPS passwords in this repository.
-- This miner only needs a public payout wallet address.
+Check that CUDA compiler is available:
 
-## Project status
+nvcc --version
 
-Experimental public testing release.
+If nvidia-smi works but nvcc is missing, use a CUDA development image or install the CUDA toolkit.
+
+Expected behaviour
+
+When running correctly, the miner should:
+
+connect to the pool
+subscribe / authorise
+receive jobs
+scan nonces on the GPU
+submit valid shares
+show accepted shares in the console or pool logs
+
+A small number of stale shares can happen if jobs change quickly.
+
+Common issues
+nvcc: command not found
+
+The CUDA compiler is missing. Use a CUDA development image, not only a runtime image.
+
+Invalid wallet error
+
+Check that your wallet starts with 0x and is 42 characters long.
+
+Cannot connect to pool
+
+Check:
+
+pool host
+pool port
+firewall rules
+VPS network access
+Permission denied running scripts
+
+Run:
+
+chmod +x build.sh run.sh run_my_pool.sh
+Important warning
+
+This is experimental mining software.
+
+Use at your own risk. No guarantee is made around profitability, compatibility, uptime, rewards, or correctness on every machine.
+
+You are responsible for checking that your wallet, pool settings, and mining environment are correct.
+
+Project status
+
+Current status:
+
+public GitHub clone tested
+.env configuration tested
+fresh Vast.ai GPU build tested
+RTX 3060 test completed successfully
+Licence
+
+No licence has currently been selected. All rights reserved unless a licence is added later.
+'@ | Set-Content README.md
