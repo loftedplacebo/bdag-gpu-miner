@@ -1,0 +1,13 @@
+# Local/private configuration
+.env
+
+# Build artefacts
+*.o
+*.so
+bdag_kepler_live_miner
+
+# Logs and temporary files
+*.log
+*.tmp
+.DS_Store
+__pycache__/
