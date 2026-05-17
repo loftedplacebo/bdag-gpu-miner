@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <csignal>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
@@ -20,6 +21,10 @@
 #include <vector>
 
 #include "hasher.h"
+#include "config.h"
+#include "metrics.h"
+#include "payload_builder.h"
+#include "job.h"
 
 // ========================
 // Stage 18A config defaults
@@ -29,14 +34,27 @@ static std::string POOL_HOST = "62.171.161.32";
 static int POOL_PORT = 3334;
 static std::string WALLET = "0xc12ee9dC15c3Fc7FCe8Ae2Ef8eD84e92c0B72310";
 static std::string PASSWORD = "x";
+static std::string WORKER_NAME = "";
 
 static int RUNTIME_SECONDS = 60;
 static long double SUBMIT_MARGIN = 1.02L;
 static long double MIN_SUBMIT_THRESHOLD = 0.25L;
 static std::string EXTRANONCE2_HEX = "00000000";
 
+static int GPU_BATCHSIZE = 0;          // 0 = auto, v18 behaviour
+static int GPU_MEM_PER_JOB = 800000;   // used only when batchsize is auto
+
 static int sockfd = -1;
 static std::atomic<bool> running(false);
+
+static void handle_shutdown_signal(int sig) {
+    running = false;
+    std::cerr << "\n[V20] shutdown signal received: " << sig << "\n";
+    if (sockfd >= 0) {
+        shutdown(sockfd, SHUT_RDWR);
+    }
+}
+
 
 static std::atomic<uint64_t> total_checked(0);
 static std::atomic<uint64_t> total_submitted(0);
@@ -47,59 +65,16 @@ static std::atomic<uint64_t> total_stale_errors(0);
 static std::atomic<uint64_t> total_stale_skipped(0);
 static std::atomic<uint64_t> total_nohit_batches(0);
 static std::atomic<uint64_t> total_hit_batches(0);
+static std::atomic<uint64_t> total_gpu_candidates(0);
+static std::atomic<uint64_t> total_multi_candidate_batches(0);
+static std::atomic<uint64_t> max_candidates_in_batch(0);
 
 static std::atomic<int> rpc_id_counter(1000);
-
-struct Job {
-    bool valid = false;
-    uint64_t seq = 0;
-
-    std::string job_id;
-    std::string prevhash;
-    std::string version;
-    std::string bits;
-    std::string ntime;
-    std::string extranonce1;
-
-    long double difficulty = 0.01L;
-};
 
 static std::mutex job_mtx;
 static Job current_job;
 static std::string extranonce1_global;
 static long double current_difficulty = 0.01L;
-
-static std::vector<uint8_t> hex_to_bytes(const std::string &hex) {
-    std::vector<uint8_t> out;
-    out.reserve(hex.size() / 2);
-
-    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-        out.push_back((uint8_t)strtoul(hex.substr(i, 2).c_str(), nullptr, 16));
-    }
-
-    return out;
-}
-
-static std::string bytes_to_hex(const uint8_t *data, size_t len) {
-    std::ostringstream oss;
-    oss << std::hex << std::setfill('0');
-
-    for (size_t i = 0; i < len; i++) {
-        oss << std::setw(2) << (int)data[i];
-    }
-
-    return oss.str();
-}
-
-static std::vector<uint8_t> sha256d(const std::vector<uint8_t> &data) {
-    uint8_t h1[SHA256_DIGEST_LENGTH];
-    uint8_t h2[SHA256_DIGEST_LENGTH];
-
-    SHA256(data.data(), data.size(), h1);
-    SHA256(h1, SHA256_DIGEST_LENGTH, h2);
-
-    return std::vector<uint8_t>(h2, h2 + SHA256_DIGEST_LENGTH);
-}
 
 static bool connect_tcp(const std::string &host, int port) {
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -297,44 +272,6 @@ static void recv_loop() {
     }
 }
 
-static bool make_payload80_from_job(const Job &j, uint8_t payload[80]) {
-    if (j.version.size() != 8 || j.prevhash.size() < 64 || j.ntime.size() != 8 || j.bits.size() != 8) {
-        return false;
-    }
-
-    if (j.extranonce1.size() != 8 || EXTRANONCE2_HEX.size() != 8) {
-        return false;
-    }
-
-    auto version = hex_to_bytes(j.version);
-    auto prevhash = hex_to_bytes(j.prevhash.substr(0, 64));
-    auto ntime = hex_to_bytes(j.ntime);
-    auto bits = hex_to_bytes(j.bits);
-
-    auto en1 = hex_to_bytes(j.extranonce1);
-    auto en2 = hex_to_bytes(EXTRANONCE2_HEX);
-
-    std::vector<uint8_t> en;
-    en.insert(en.end(), en1.begin(), en1.end());
-    en.insert(en.end(), en2.begin(), en2.end());
-
-    auto merkle_like = sha256d(en);
-
-    memcpy(payload + 0, version.data(), 4);
-    memcpy(payload + 4, prevhash.data(), 32);
-    memcpy(payload + 36, merkle_like.data(), 32);
-    memcpy(payload + 68, ntime.data(), 4);
-    memcpy(payload + 72, bits.data(), 4);
-
-    // Nonce bytes filled later by pdata[19].
-    payload[76] = 0;
-    payload[77] = 0;
-    payload[78] = 0;
-    payload[79] = 0;
-
-    return true;
-}
-
 static void make_kepler_target_from_threshold(long double threshold, uint32_t target[8]) {
     for (int i = 0; i < 8; i++) target[i] = 0;
 
@@ -377,53 +314,28 @@ static void submit_nonce(const Job &j, uint32_t nonce_word) {
     total_submitted++;
 }
 
-static void print_usage(const char *prog) {
-    std::cout << "Usage: " << prog << " [options]\n"
-              << "  --host <host>              Pool host or IP address\n"
-              << "  --port <port>              Pool port\n"
-              << "  --wallet <0x...>           EVM-style payout wallet address\n"
-              << "  --password <password>      Stratum password, usually x\n"
-              << "  --runtime <seconds>        Runtime before exit\n"
-              << "  --margin <number>          Submission margin, e.g. 1.02\n"
-              << "  --min-threshold <number>   Minimum submission threshold\n"
-              << "  --extranonce2 <hex>        Extranonce2 value, usually 00000000\n"
-              << "  --help                     Show this help message\n";
-}
-
-static bool valid_wallet(const std::string &wallet) {
-    static const std::regex wallet_re("^0x[0-9a-fA-F]{40}$");
-    return std::regex_match(wallet, wallet_re)
-        && wallet != "0x0000000000000000000000000000000000000000";
-}
-
-static void parse_args(int argc, char **argv) {
-    for (int i = 1; i < argc; i++) {
-        std::string a = argv[i];
-
-        if (a == "--help" || a == "-h") {
-            print_usage(argv[0]);
-            std::exit(0);
-        }
-        else if (a == "--host" && i + 1 < argc) POOL_HOST = argv[++i];
-        else if (a == "--port" && i + 1 < argc) POOL_PORT = atoi(argv[++i]);
-        else if (a == "--wallet" && i + 1 < argc) WALLET = argv[++i];
-        else if (a == "--password" && i + 1 < argc) PASSWORD = argv[++i];
-        else if (a == "--runtime" && i + 1 < argc) RUNTIME_SECONDS = atoi(argv[++i]);
-        else if (a == "--margin" && i + 1 < argc) SUBMIT_MARGIN = strtold(argv[++i], nullptr);
-        else if (a == "--min-threshold" && i + 1 < argc) MIN_SUBMIT_THRESHOLD = strtold(argv[++i], nullptr);
-        else if (a == "--extranonce2" && i + 1 < argc) EXTRANONCE2_HEX = argv[++i];
-        else {
-            std::cerr << "Unknown or incomplete argument: " << a << "\n";
-            print_usage(argv[0]);
-            std::exit(1);
-        }
-    }
-}
-
 int main(int argc, char **argv) {
-    parse_args(argc, argv);
+    std::signal(SIGINT, handle_shutdown_signal);
+    std::signal(SIGTERM, handle_shutdown_signal);
 
-    if (!valid_wallet(WALLET)) {
+    MinerConfig cfg;
+    if (!parse_args(argc, argv, cfg)) {
+        return 1;
+    }
+
+    POOL_HOST = cfg.pool_host;
+    POOL_PORT = cfg.pool_port;
+    WALLET = cfg.wallet;
+    PASSWORD = cfg.password;
+    WORKER_NAME = cfg.worker_name.empty() ? cfg.wallet : cfg.worker_name;
+    RUNTIME_SECONDS = cfg.runtime_seconds;
+    SUBMIT_MARGIN = cfg.submit_margin;
+    MIN_SUBMIT_THRESHOLD = cfg.min_submit_threshold;
+    EXTRANONCE2_HEX = cfg.extranonce2_hex;
+    GPU_BATCHSIZE = cfg.gpu_batchsize;
+    GPU_MEM_PER_JOB = cfg.gpu_mem_per_job;
+
+    if (!is_valid_wallet(WALLET) || WALLET == "0x0000000000000000000000000000000000000000") {
         std::cerr << "[FINAL18A] FAIL invalid wallet. Use a non-placeholder 42-character EVM address beginning with 0x.\n";
         return 1;
     }
@@ -431,11 +343,14 @@ int main(int argc, char **argv) {
     std::cout << "[STAGE18A] Keplerminer BDAG live miner\n";
     std::cout << "[STAGE18A] pool=" << POOL_HOST << ":" << POOL_PORT << "\n";
     std::cout << "[STAGE18A] wallet=" << WALLET << "\n";
+    std::cout << "[STAGE18A] worker_name=" << WORKER_NAME << "\n";
     std::cout << "[STAGE18A] runtime=" << RUNTIME_SECONDS << "s\n";
     std::cout << "[STAGE18A] margin=" << std::fixed << std::setprecision(4) << (double)SUBMIT_MARGIN << "\n";
     std::cout << "[STAGE18A] min_threshold=" << std::fixed << std::setprecision(4) << (double)MIN_SUBMIT_THRESHOLD << "\n";
+    std::cout << "[V19] gpu_batchsize_request=" << GPU_BATCHSIZE << "\n";
+    std::cout << "[V19] gpu_mem_per_job=" << GPU_MEM_PER_JOB << "\n";
 
-    CudaHasher *hasher = new CudaHasher();
+    CudaHasher *hasher = new CudaHasher(GPU_BATCHSIZE, GPU_MEM_PER_JOB);
 
     if (hasher->Initialize() != 0) {
         std::cerr << "[FINAL18A] FAIL Keplerminer CudaHasher initialisation failed\n";
@@ -470,7 +385,7 @@ int main(int argc, char **argv) {
         auto now = std::chrono::steady_clock::now();
         double elapsed_total = std::chrono::duration<double>(now - start_time).count();
 
-        if (elapsed_total >= RUNTIME_SECONDS) {
+        if (RUNTIME_SECONDS > 0 && elapsed_total >= RUNTIME_SECONDS) {
             running = false;
             break;
         }
@@ -489,7 +404,7 @@ int main(int argc, char **argv) {
 
         uint8_t payload[80];
 
-        if (!make_payload80_from_job(j, payload)) {
+        if (!make_payload80_from_job(j, EXTRANONCE2_HEX, payload)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             continue;
         }
@@ -508,7 +423,8 @@ int main(int argc, char **argv) {
         int stop = 0;
         unsigned long hashes_done = 0;
 
-        int rc = hasher->ScanNCoins(pdata, target, batchsize, &stop, &hashes_done);
+        std::vector<uint32_t> candidate_offsets;
+        int rc = hasher->ScanNCoins(pdata, target, batchsize, &stop, &hashes_done, &candidate_offsets);
 
         total_checked += batchsize;
         batches++;
@@ -519,16 +435,29 @@ int main(int argc, char **argv) {
             latest = current_job;
         }
 
-        if (rc >= 0) {
-            uint32_t found_nonce_word = start_nonce_word + (uint32_t)rc;
+        if (!candidate_offsets.empty()) {
             total_hit_batches++;
+
+            uint64_t cand_count = candidate_offsets.size();
+            total_gpu_candidates += cand_count;
+            if (cand_count > 1) {
+                total_multi_candidate_batches++;
+            }
+
+            uint64_t prev_max = max_candidates_in_batch.load();
+            while (cand_count > prev_max && !max_candidates_in_batch.compare_exchange_weak(prev_max, cand_count)) {
+                // retry until max is updated
+            }
 
             bool stale_batch = (!latest.valid || latest.seq != j.seq || latest.job_id != j.job_id);
 
             if (stale_batch) {
-                total_stale_skipped++;
+                total_stale_skipped += cand_count;
             } else {
-                submit_nonce(j, found_nonce_word);
+                for (uint32_t off : candidate_offsets) {
+                    uint32_t found_nonce_word = start_nonce_word + off;
+                    submit_nonce(j, found_nonce_word);
+                }
             }
         } else {
             total_nohit_batches++;
@@ -548,6 +477,9 @@ int main(int argc, char **argv) {
                       << " batches=" << batches
                       << " hit_batches=" << total_hit_batches.load()
                       << " nohit_batches=" << total_nohit_batches.load()
+                      << " gpu_candidates=" << total_gpu_candidates.load()
+                      << " multi_candidate_batches=" << total_multi_candidate_batches.load()
+                      << " max_candidates_in_batch=" << max_candidates_in_batch.load()
                       << " submitted=" << total_submitted.load()
                       << " accepted=" << total_accepted.load()
                       << " errors=" << total_errors.load()
@@ -582,6 +514,9 @@ int main(int argc, char **argv) {
               << " batches=" << batches
               << " hit_batches=" << total_hit_batches.load()
               << " nohit_batches=" << total_nohit_batches.load()
+              << " gpu_candidates=" << total_gpu_candidates.load()
+              << " multi_candidate_batches=" << total_multi_candidate_batches.load()
+              << " max_candidates_in_batch=" << max_candidates_in_batch.load()
               << " submitted=" << total_submitted.load()
               << " accepted=" << total_accepted.load()
               << " errors=" << total_errors.load()
@@ -592,6 +527,21 @@ int main(int argc, char **argv) {
 
     delete hasher;
 
+
+    MinerMetrics final_metrics;
+    final_metrics.checked.store(total_checked.load());
+    final_metrics.submitted.store(total_submitted.load());
+    final_metrics.accepted.store(total_accepted.load());
+    final_metrics.errors.store(total_errors.load());
+    final_metrics.lowdiff.store(total_lowdiff.load());
+    final_metrics.stale_errors.store(total_stale_errors.load());
+    final_metrics.stale_skipped.store(total_stale_skipped.load());
+    final_metrics.nohit_batches.store(total_nohit_batches.load());
+    final_metrics.hit_batches.store(total_hit_batches.load());
+
+    std::cout << format_v20_result(final_metrics, elapsed, batchsize, batches) << "\n";
+
     std::cout << "[FINAL18A] Done\n";
     return 0;
 }
+

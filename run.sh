@@ -26,10 +26,12 @@ set +a
 : "${POOL_PORT:=3334}"
 : "${WALLET:=}"
 : "${PASSWORD:=x}"
-: "${RUNTIME_SECONDS:=600}"
+: "${WORKER_NAME:=$WALLET}"
+: "${RUNTIME_SECONDS:=9999999999999}"
 : "${SUBMIT_MARGIN:=1.02}"
 : "${MIN_SUBMIT_THRESHOLD:=0.25}"
 : "${EXTRANONCE2_HEX:=00000000}"
+: "${BATCHSIZE:=32768}"
 
 if [[ ! "$WALLET" =~ ^0x[a-fA-F0-9]{40}$ ]]; then
   echo "Invalid WALLET in .env" >&2
@@ -42,24 +44,28 @@ if [[ "$WALLET" == "0x0000000000000000000000000000000000000000" ]]; then
   exit 1
 fi
 
-if [[ ! -x ./bdag_kepler_live_miner ]]; then
-  echo "Missing executable ./bdag_kepler_live_miner" >&2
-  echo "Run ./build.sh first, or download a release package that includes the binary." >&2
+if [[ ! -x ./build/bdag_v20_miner ]]; then
+  echo "Missing executable ./build/bdag_v20_miner" >&2
+  echo "Run ./scripts/build.sh first, or download a release package that includes the binary." >&2
   exit 1
 fi
 
-echo "BDAG GPU Miner"
-echo "Pool:   ${POOL_HOST}:${POOL_PORT}"
-echo "Wallet: ${WALLET:0:8}...${WALLET: -6}"
-echo "Runtime: ${RUNTIME_SECONDS}s"
+echo "BDAG GPU Miner v20"
+echo "Pool:        ${POOL_HOST}:${POOL_PORT}"
+echo "Wallet:      ${WALLET:0:8}...${WALLET: -6}"
+echo "Worker name: ${WORKER_NAME}"
+echo "Runtime:     ${RUNTIME_SECONDS}s"
 echo
 
-exec ./bdag_kepler_live_miner \
+exec ./build/bdag_v20_miner \
   --host "$POOL_HOST" \
   --port "$POOL_PORT" \
   --wallet "$WALLET" \
   --password "$PASSWORD" \
+  --worker-name "$WORKER_NAME" \
   --runtime "$RUNTIME_SECONDS" \
   --margin "$SUBMIT_MARGIN" \
   --min-threshold "$MIN_SUBMIT_THRESHOLD" \
-  --extranonce2 "$EXTRANONCE2_HEX"
+  --extranonce2 "$EXTRANONCE2_HEX" \
+  --batchsize "$BATCHSIZE"
+

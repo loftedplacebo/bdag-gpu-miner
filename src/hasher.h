@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <string>
+#include <vector>
 
 
 struct scrypt_hash {
@@ -26,18 +27,20 @@ typedef struct {
 
 class CudaHasher {
 public:
-  CudaHasher();
+  CudaHasher(int requested_batchsize = 0, int mem_per_job_override = 800000);
   int Initialize();
   int ComputeHashes(const scrypt_hash *in, scrypt_hash *out, int n_hashes);
   ~CudaHasher();
 
-  int ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n, volatile int *stop, unsigned long *hashes_done);
+  int ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n, volatile int *stop, unsigned long *hashes_done, std::vector<uint32_t> *candidate_offsets = nullptr);
 
   int HashOneForDebug(uint32_t *pdata, uint32_t nonce, uint32_t *out_hash8);
 
   int TestLoadStore();
 
   int GetBatchSize() const { return batchsize; }
+  int GetMemPerJob() const { return mem_per_job_override; }
+  int GetRequestedBatchSize() const { return requested_batchsize; }
 
 private:
   uint32_t *dev_keys; // internal code is still viewing these as uint32_t blobs.
@@ -50,9 +53,12 @@ private:
   uint32_t *scan_output;
   int batchsize;
   int n_blocks;
+  int requested_batchsize;
+  int mem_per_job_override;
 };
 
 static const int THREADS_PER_SCRYPT_BLOCK = 4;
+static const int MAX_CANDIDATES_PER_BATCH = 256;
 static const int THREADS_PER_CUDA_BLOCK = 192; // Must be a multiple of TPScB
 static const int SCRYPT_SCRATCH_PER_BLOCK = (32*1024);
 static const int SCRYPT_WIDTH = 16;

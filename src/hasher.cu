@@ -542,6 +542,20 @@ __global__ void scrypt_hash_finish_kernel(const __restrict__ uint32_t *dev_keys,
     t = *(uint4 *)&dev_keys[blockstart+i];
     hash[i] = t.x; hash[i+1] = t.y; hash[i+2] = t.z; hash[i+3] = t.w;
   }
+
+  /*
+   * V20 optimisation:
+   * Fold the BlockDAG post-ROMix tweak into the finish kernel.
+   * This removes the separate bdag_post_romix_tweak_kernel launch
+   * from the hot ScanNCoins path while preserving the exact mutation:
+   *
+   *   x = swab32(X[0])
+   *   x = (x & 0xffff8000) | ((x + 0xe0) & 0x7fff)
+   *   X[0] = swab32(x)
+   */
+  uint32_t bdag_x0 = swab32(hash[0]);
+  bdag_x0 = (bdag_x0 & 0xffff8000u) | ((bdag_x0 + 0xe0u) & 0x7fffu);
+  hash[0] = swab32(bdag_x0);
   
   dev_PBKDF2_SHA256_128_32(tstate, ostate, hash);
 
@@ -559,8 +573,15 @@ __global__ void scrypt_hash_finish_kernel(const __restrict__ uint32_t *dev_keys,
   foundit = foundit ? (blockid+1) : foundit;
 
   if (foundit) {
-    // Finding the lowest doesn't matter.  Just let the first writer win.
-    uint32_t oldval = atomicCAS(&dev_output[0], 0, foundit);
+    /*
+     * V20 multi-candidate output:
+     * dev_output[0] = candidate count.
+     * dev_output[1..MAX_CANDIDATES_PER_BATCH] = found offsets encoded as blockid + 1.
+     */
+    uint32_t idx = atomicAdd(&dev_output[0], 1);
+    if (idx < MAX_CANDIDATES_PER_BATCH) {
+      dev_output[1 + idx] = foundit;
+    }
   }
 }
 
@@ -584,12 +605,15 @@ void test_load_store_kernel(__restrict__ uint32_t *B, __restrict__ uint32_t *scr
  * You must call Initialize() and check the error code.
  */
 
-CudaHasher::CudaHasher() :
+CudaHasher::CudaHasher(int requested_batchsize_, int mem_per_job_override_) :
   dev_keys(NULL), dev_scratch(NULL), dev_output(NULL), 
   dev_tstate(NULL), dev_ostate(NULL), scan_output(NULL),
-  dev_job(NULL) {
-  //  dev_keys = NULL;
-  //  dev_scratch = NULL;
+  dev_job(NULL),
+  batchsize(0), n_blocks(0),
+  requested_batchsize(requested_batchsize_),
+  mem_per_job_override(mem_per_job_override_) {
+  if (mem_per_job_override <= 0) mem_per_job_override = 800000;
+  if (requested_batchsize < 0) requested_batchsize = 0;
 }
 
 /*
@@ -616,14 +640,24 @@ int CudaHasher::Initialize() {
   size_t free, total;
   cudaMemGetInfo(&free, &total);
   //printf("Initializing.  Device has %ld free of %ld total bytes of memory\n", free, total);
-  int mem_per_job = 800000; /* BDAG test patch: smaller safer batch on modern CUDA */
+  int mem_per_job = mem_per_job_override;
   int max_batchsize = free / mem_per_job;
 
-  /* We need 4 threads per work unit and each block should have 192 threads */
-  /* The number of blocks should also probably be a multiple of the
-   * number of multiprocessors.  I'm using 8 here as a simple way
-   * to get a pretty-OK answer that's probably not optimal for big GPUs */
-  batchsize = (max_batchsize/(2*THREADS_PER_CUDA_BLOCK))*2*THREADS_PER_CUDA_BLOCK;
+  /* We need 4 threads per work unit and each block should have 192 threads.
+   * Keep batchsize aligned to 2 * THREADS_PER_CUDA_BLOCK, matching the v18 logic.
+   */
+  int align = 2 * THREADS_PER_CUDA_BLOCK;
+
+  if (requested_batchsize > 0) {
+    batchsize = (requested_batchsize / align) * align;
+    if (batchsize < align) batchsize = align;
+    fprintf(stderr, "[V19] requested_batchsize=%d aligned_batchsize=%d\n", requested_batchsize, batchsize);
+  } else {
+    batchsize = (max_batchsize / align) * align;
+    fprintf(stderr, "[V19] auto batch sizing: free_mem=%zu total_mem=%zu mem_per_job=%d max_batchsize=%d aligned_batchsize=%d\n",
+            free, total, mem_per_job, max_batchsize, batchsize);
+  }
+
   n_blocks = (batchsize*THREADS_PER_SCRYPT_BLOCK/THREADS_PER_CUDA_BLOCK);
 
   error = cudaMalloc((void **) &dev_job, sizeof(scan_job));
@@ -650,7 +684,7 @@ int CudaHasher::Initialize() {
   }
 
   /* dev_output holds one int per warp indicating if a thread in that warp solved the block */
-  error = cudaMalloc((void **) &dev_output, sizeof(uint32_t));
+  error = cudaMalloc((void **) &dev_output, sizeof(uint32_t) * (MAX_CANDIDATES_PER_BATCH + 1));
   if (error != cudaSuccess) {
     fprintf(stderr, "Could not allocate CUDA array, error code %d, line(%d)\n", error, __LINE__);
     dev_output = NULL;
@@ -671,7 +705,7 @@ int CudaHasher::Initialize() {
     return -1;
   }
 
-  scan_output = (uint32_t *)malloc(sizeof(uint32_t));
+  scan_output = (uint32_t *)malloc(sizeof(uint32_t) * (MAX_CANDIDATES_PER_BATCH + 1));
   if (!scan_output) {
     perror("Could not allocate scan output buffer (host)");
     return -1;
@@ -806,8 +840,10 @@ int CudaHasher::ComputeHashes(const scrypt_hash *in, scrypt_hash *out, int n_has
 
 }
 
-int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashes, volatile int *stop, unsigned long *hashes_done)
+int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashes, volatile int *stop, unsigned long *hashes_done, std::vector<uint32_t> *candidate_offsets)
 {
+  if (candidate_offsets) candidate_offsets->clear();
+
   int n_done = 0;
 
   uint32_t data[20];
@@ -829,9 +865,9 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
     exit(-1);
   }
 
-  error = cudaMemcpy(dev_output, scan_output, sizeof(uint32_t), cudaMemcpyHostToDevice);
+  error = cudaMemset(dev_output, 0, sizeof(uint32_t) * (MAX_CANDIDATES_PER_BATCH + 1));
   if (error != cudaSuccess) {
-    fprintf(stderr, "Could not memcpy job to device, error code %d, line(%d)\n", error, __LINE__);
+    fprintf(stderr, "Could not memset output buffer on device, error code %d, line(%d)\n", error, __LINE__);
     exit(-1);
   }
 
@@ -844,8 +880,8 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
     static const int threads = THREADS_PER_CUDA_BLOCK;
     
     scrypt_hash_start_kernel<<<n_blocks/4, threads>>>(dev_job, dev_keys, dev_ostate, dev_tstate, n);
-    hasher_combo_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
-    bdag_post_romix_tweak_kernel<<<n_blocks/4, threads>>>(dev_keys, batchsize);
+    hasher_gen_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
+    hasher_hash_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
     scrypt_hash_finish_kernel<<<n_blocks/4, threads>>>(dev_keys, dev_tstate, dev_ostate, dev_output, dev_job);
 
     error = cudaDeviceSynchronize();
@@ -854,16 +890,37 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
       exit(-1);
     }
 
-    error = cudaMemcpy(scan_output, dev_output, sizeof(uint32_t), cudaMemcpyDeviceToHost);
+    error = cudaMemcpy(scan_output, dev_output, sizeof(uint32_t) * (MAX_CANDIDATES_PER_BATCH + 1), cudaMemcpyDeviceToHost);
 
     if (error != cudaSuccess) {
       fprintf(stderr, "Could not memcpy from device, error code %d, line(%d)\n", error, __LINE__);
       exit(-1);
     }
 
-    if (*scan_output != 0) {
+    uint32_t candidate_count = scan_output[0];
+    if (candidate_count != 0) {
+      uint32_t capped = candidate_count;
+      if (capped > MAX_CANDIDATES_PER_BATCH) capped = MAX_CANDIDATES_PER_BATCH;
+
+      if (candidate_offsets) {
+        candidate_offsets->reserve(candidate_offsets->size() + capped);
+        for (uint32_t ci = 0; ci < capped; ++ci) {
+          uint32_t found_encoded = scan_output[1 + ci];
+          if (found_encoded != 0) {
+            candidate_offsets->push_back(n_done + found_encoded - 1);
+          }
+        }
+      }
+
       if (hashes_done != NULL) *hashes_done += n_done;
-      return n_done + *scan_output - 1; // -1 because of 0 blockIdx
+
+      if (candidate_offsets && !candidate_offsets->empty()) {
+        return (int)candidate_offsets->size();
+      }
+
+      if (scan_output[1] != 0) {
+        return n_done + scan_output[1] - 1;
+      }
     }
 
     n_done += batchsize;
@@ -904,7 +961,6 @@ int CudaHasher::HashOneForDebug(uint32_t *pdata, uint32_t nonce, uint32_t *out_h
 
   scrypt_hash_start_kernel<<<n_blocks/4, threads>>>(dev_job, dev_keys, dev_ostate, dev_tstate, nonce);
   hasher_combo_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
-  bdag_post_romix_tweak_kernel<<<1, threads>>>(dev_keys, batchsize);
   scrypt_hash_finish_output_kernel<<<1, threads>>>(dev_keys, dev_tstate, dev_ostate, dev_hash_out);
 
   error = cudaDeviceSynchronize();
