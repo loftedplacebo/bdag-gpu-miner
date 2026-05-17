@@ -57,7 +57,7 @@ POOL_HOST=62.171.161.32
 POOL_PORT=3334
 WALLET=0xYourWalletAddressHere
 WORKER_NAME=gpu01
-RUNTIME_SECONDS=300
+RUNTIME_SECONDS=9999999999999
 MARGIN=0.99
 MIN_THRESHOLD=0.01
 Settings explained
@@ -166,4 +166,3 @@ RTX 3060 test completed successfully
 Licence
 
 No licence has currently been selected. All rights reserved unless a licence is added later.
-'@ | Set-Content README.md
