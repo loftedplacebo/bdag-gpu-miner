@@ -11,3 +11,9 @@ bdag_kepler_live_miner
 *.tmp
 .DS_Store
 __pycache__/
+
+# Runtime logs and process IDs
+logs/*
+!logs/.gitkeep
+*.pid
+nohup.out

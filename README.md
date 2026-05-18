@@ -166,3 +166,32 @@ RTX 3060 test completed successfully
 Licence
 
 No licence has currently been selected. All rights reserved unless a licence is added later.
+
+## Running continuously with keepalive
+
+For long-running GPU rentals, use keepalive.sh instead of running run.sh directly. It restarts the miner automatically if the pool connection drops or the miner exits.
+
+Start on the GPU VPS:
+
+    cd /workspace/bdag-gpu-miner
+    mkdir -p logs
+    nohup ./keepalive.sh > logs/keepalive_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    echo $! > keepalive.pid
+
+Check it is running:
+
+    ps -p $(cat keepalive.pid) -o pid,etime,cmd
+    ps aux | grep -E "keepalive|bdag_v20_miner" | grep -v grep
+    nvidia-smi
+
+Watch logs:
+
+    LATEST=$(ls -t logs/miner_*.log | head -1)
+    echo "$LATEST"
+    tail -f "$LATEST"
+
+Stop it:
+
+    kill $(cat keepalive.pid)
+    pkill -f bdag_v20_miner
+
