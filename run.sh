@@ -22,8 +22,8 @@ set -a
 source "$ENV_FILE"
 set +a
 
-: "${POOL_HOST:=62.171.161.32}"
-: "${POOL_PORT:=3334}"
+: "${POOL_HOST:=excalibur.dagtech.network}"
+: "${POOL_PORT:=3335}"
 : "${WALLET:=}"
 : "${PASSWORD:=x}"
 : "${WORKER_NAME:=$WALLET}"

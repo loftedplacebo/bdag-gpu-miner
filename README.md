@@ -53,8 +53,8 @@ All user settings are controlled through .env.
 
 Example:
 
-POOL_HOST=62.171.161.32
-POOL_PORT=3334
+POOL_HOST=excalibur.dagtech.network
+POOL_PORT=3335
 WALLET=0xYourWalletAddressHere
 WORKER_NAME=gpu01
 RUNTIME_SECONDS=9999999999999

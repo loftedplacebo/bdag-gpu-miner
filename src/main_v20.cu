@@ -30,8 +30,8 @@
 // Stage 18A config defaults
 // ========================
 
-static std::string POOL_HOST = "62.171.161.32";
-static int POOL_PORT = 3334;
+static std::string POOL_HOST = "excalibur.dagtech.network";
+static int POOL_PORT = 3335;
 static std::string WALLET = "0xc12ee9dC15c3Fc7FCe8Ae2Ef8eD84e92c0B72310";
 static std::string PASSWORD = "x";
 static std::string WORKER_NAME = "";

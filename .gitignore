@@ -1,5 +1,6 @@
 # Local/private configuration
 .env
+vast_instances.json
 
 # Build artefacts
 *.o

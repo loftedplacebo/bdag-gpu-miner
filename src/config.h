@@ -3,8 +3,8 @@
 #include <string>
 
 struct MinerConfig {
-    std::string pool_host = "62.171.161.32";
-    int pool_port = 3334;
+    std::string pool_host = "excalibur.dagtech.network";
+    int pool_port = 3335;
 
     std::string wallet = "0xc12ee9dC15c3Fc7FCe8Ae2Ef8eD84e92c0B72310";
     std::string password = "x";
