@@ -1,5 +1,6 @@
 CFLAGS=-O3 -march=native 
-NVFLAGS= --gpu-architecture sm_86 -O3 -std=c++17 
+CUDA_ARCH ?= sm_86
+NVFLAGS= --gpu-architecture $(CUDA_ARCH) -O3 -std=c++17
 #sm_35 -O3  # for Tesla
 all: key_per_thread hasher_bench hasher_c.so hasher_test
 

@@ -1,6 +1,7 @@
 # Local/private configuration
 .env
 vast_instances.json
+.miner-autotune.json
 
 # Build artefacts
 *.o

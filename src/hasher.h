@@ -13,6 +13,21 @@
 #include <string>
 #include <vector>
 
+enum class KernelMode {
+  Split,
+  Combo
+};
+
+struct ScanTimings {
+  double total_ms = 0.0;
+  double output_clear_ms = 0.0;
+  double start_kernel_ms = 0.0;
+  double gen_kernel_ms = 0.0;
+  double hash_kernel_ms = 0.0;
+  double combo_kernel_ms = 0.0;
+  double finish_kernel_ms = 0.0;
+  double output_copy_ms = 0.0;
+};
 
 struct scrypt_hash {
   uint32_t b[16];
@@ -27,12 +42,12 @@ typedef struct {
 
 class CudaHasher {
 public:
-  CudaHasher(int requested_batchsize = 0, int mem_per_job_override = 800000);
+  CudaHasher(int requested_batchsize = 0, int mem_per_job_override = 800000, KernelMode kernel_mode = KernelMode::Split);
   int Initialize();
   int ComputeHashes(const scrypt_hash *in, scrypt_hash *out, int n_hashes);
   ~CudaHasher();
 
-  int ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n, volatile int *stop, unsigned long *hashes_done, std::vector<uint32_t> *candidate_offsets = nullptr);
+  int ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n, volatile int *stop, unsigned long *hashes_done, std::vector<uint32_t> *candidate_offsets = nullptr, ScanTimings *timings = nullptr);
 
   int HashOneForDebug(uint32_t *pdata, uint32_t nonce, uint32_t *out_hash8);
 
@@ -41,6 +56,7 @@ public:
   int GetBatchSize() const { return batchsize; }
   int GetMemPerJob() const { return mem_per_job_override; }
   int GetRequestedBatchSize() const { return requested_batchsize; }
+  KernelMode GetKernelMode() const { return kernel_mode; }
 
 private:
   uint32_t *dev_keys; // internal code is still viewing these as uint32_t blobs.
@@ -55,6 +71,7 @@ private:
   int n_blocks;
   int requested_batchsize;
   int mem_per_job_override;
+  KernelMode kernel_mode;
 };
 
 static const int THREADS_PER_SCRYPT_BLOCK = 4;

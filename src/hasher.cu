@@ -5,6 +5,7 @@
  */
 
 #include <sys/time.h>
+#include <chrono>
 #include "hasher.h"
 #include "scrypt_cores.cu"
 
@@ -605,13 +606,14 @@ void test_load_store_kernel(__restrict__ uint32_t *B, __restrict__ uint32_t *scr
  * You must call Initialize() and check the error code.
  */
 
-CudaHasher::CudaHasher(int requested_batchsize_, int mem_per_job_override_) :
+CudaHasher::CudaHasher(int requested_batchsize_, int mem_per_job_override_, KernelMode kernel_mode_) :
   dev_keys(NULL), dev_scratch(NULL), dev_output(NULL), 
   dev_tstate(NULL), dev_ostate(NULL), scan_output(NULL),
   dev_job(NULL),
   batchsize(0), n_blocks(0),
   requested_batchsize(requested_batchsize_),
-  mem_per_job_override(mem_per_job_override_) {
+  mem_per_job_override(mem_per_job_override_),
+  kernel_mode(kernel_mode_) {
   if (mem_per_job_override <= 0) mem_per_job_override = 800000;
   if (requested_batchsize < 0) requested_batchsize = 0;
 }
@@ -840,9 +842,12 @@ int CudaHasher::ComputeHashes(const scrypt_hash *in, scrypt_hash *out, int n_has
 
 }
 
-int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashes, volatile int *stop, unsigned long *hashes_done, std::vector<uint32_t> *candidate_offsets)
+int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashes, volatile int *stop, unsigned long *hashes_done, std::vector<uint32_t> *candidate_offsets, ScanTimings *timings)
 {
   if (candidate_offsets) candidate_offsets->clear();
+  if (timings) *timings = ScanTimings();
+
+  auto total_start = std::chrono::steady_clock::now();
 
   int n_done = 0;
 
@@ -865,10 +870,15 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
     exit(-1);
   }
 
+  auto clear_start = std::chrono::steady_clock::now();
   error = cudaMemset(dev_output, 0, sizeof(uint32_t) * (MAX_CANDIDATES_PER_BATCH + 1));
   if (error != cudaSuccess) {
     fprintf(stderr, "Could not memset output buffer on device, error code %d, line(%d)\n", error, __LINE__);
     exit(-1);
+  }
+  auto clear_end = std::chrono::steady_clock::now();
+  if (timings) {
+    timings->output_clear_ms = std::chrono::duration<double, std::milli>(clear_end - clear_start).count();
   }
 
 
@@ -879,10 +889,36 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
     // the hashing kernel uses 1 thread per hash.
     static const int threads = THREADS_PER_CUDA_BLOCK;
     
+    cudaEvent_t ev_start = NULL;
+    cudaEvent_t ev_after_start = NULL;
+    cudaEvent_t ev_after_gen = NULL;
+    cudaEvent_t ev_after_hash = NULL;
+    cudaEvent_t ev_after_finish = NULL;
+
+    if (timings) {
+      cudaEventCreate(&ev_start);
+      cudaEventCreate(&ev_after_start);
+      cudaEventCreate(&ev_after_gen);
+      cudaEventCreate(&ev_after_hash);
+      cudaEventCreate(&ev_after_finish);
+      cudaEventRecord(ev_start, 0);
+    }
+
     scrypt_hash_start_kernel<<<n_blocks/4, threads>>>(dev_job, dev_keys, dev_ostate, dev_tstate, n);
-    hasher_gen_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
-    hasher_hash_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
+    if (timings) cudaEventRecord(ev_after_start, 0);
+
+    if (kernel_mode == KernelMode::Combo) {
+      hasher_combo_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
+      if (timings) cudaEventRecord(ev_after_hash, 0);
+    } else {
+      hasher_gen_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
+      if (timings) cudaEventRecord(ev_after_gen, 0);
+      hasher_hash_kernel<<<n_blocks, threads>>>(dev_keys, dev_scratch);
+      if (timings) cudaEventRecord(ev_after_hash, 0);
+    }
+
     scrypt_hash_finish_kernel<<<n_blocks/4, threads>>>(dev_keys, dev_tstate, dev_ostate, dev_output, dev_job);
+    if (timings) cudaEventRecord(ev_after_finish, 0);
 
     error = cudaDeviceSynchronize();
     if (error != cudaSuccess) {
@@ -890,7 +926,37 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
       exit(-1);
     }
 
+    if (timings) {
+      float ms = 0.0f;
+      cudaEventElapsedTime(&ms, ev_start, ev_after_start);
+      timings->start_kernel_ms += ms;
+
+      if (kernel_mode == KernelMode::Combo) {
+        cudaEventElapsedTime(&ms, ev_after_start, ev_after_hash);
+        timings->combo_kernel_ms += ms;
+      } else {
+        cudaEventElapsedTime(&ms, ev_after_start, ev_after_gen);
+        timings->gen_kernel_ms += ms;
+        cudaEventElapsedTime(&ms, ev_after_gen, ev_after_hash);
+        timings->hash_kernel_ms += ms;
+      }
+
+      cudaEventElapsedTime(&ms, ev_after_hash, ev_after_finish);
+      timings->finish_kernel_ms += ms;
+
+      cudaEventDestroy(ev_start);
+      cudaEventDestroy(ev_after_start);
+      cudaEventDestroy(ev_after_gen);
+      cudaEventDestroy(ev_after_hash);
+      cudaEventDestroy(ev_after_finish);
+    }
+
+    auto copy_start = std::chrono::steady_clock::now();
     error = cudaMemcpy(scan_output, dev_output, sizeof(uint32_t) * (MAX_CANDIDATES_PER_BATCH + 1), cudaMemcpyDeviceToHost);
+    auto copy_end = std::chrono::steady_clock::now();
+    if (timings) {
+      timings->output_copy_ms += std::chrono::duration<double, std::milli>(copy_end - copy_start).count();
+    }
 
     if (error != cudaSuccess) {
       fprintf(stderr, "Could not memcpy from device, error code %d, line(%d)\n", error, __LINE__);
@@ -915,10 +981,18 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
       if (hashes_done != NULL) *hashes_done += n_done;
 
       if (candidate_offsets && !candidate_offsets->empty()) {
+        if (timings) {
+          auto total_end = std::chrono::steady_clock::now();
+          timings->total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+        }
         return (int)candidate_offsets->size();
       }
 
       if (scan_output[1] != 0) {
+        if (timings) {
+          auto total_end = std::chrono::steady_clock::now();
+          timings->total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+        }
         return n_done + scan_output[1] - 1;
       }
     }
@@ -928,6 +1002,10 @@ int CudaHasher::ScanNCoins(uint32_t *pdata, const uint32_t *ptarget, int n_hashe
   }
 
   if (hashes_done != NULL) *hashes_done += n_done;
+  if (timings) {
+    auto total_end = std::chrono::steady_clock::now();
+    timings->total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+  }
   return -1;
 }
 

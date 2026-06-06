@@ -14,10 +14,20 @@ void print_usage(const char *argv0) {
         << "  --worker-name <name>        Optional worker label for logs\n"
         << "  --runtime <seconds>         Runtime before exit, 0 = run forever\n"
         << "  --margin <value>            Submit margin, default 1.02\n"
-        << "  --min-threshold <value>     Minimum submit threshold, default 0.25\n"
+        << "  --min-threshold <value>     Minimum submit threshold, default 0.0\n"
         << "  --extranonce2 <hex>         Extranonce2 override, default 00000000\n"
         << "  --batchsize <n>             GPU batch size, 0 = auto\n"
         << "  --mem-per-job <bytes>       Auto batch memory estimate\n"
+        << "  --kernel-mode <mode>        split, combo, or auto\n"
+        << "  --autotune                  Tune batch size/kernel mode before steady mining\n"
+        << "  --no-autotune               Disable launch autotune\n"
+        << "  --autotune-force            Ignore cached autotune result\n"
+        << "  --autotune-seconds <n>      Total autotune budget, default 1800\n"
+        << "  --autotune-batches <list>   Comma-separated batch sizes\n"
+        << "  --autotune-cache <path>     Autotune cache path\n"
+        << "  --target-batch-ms <ms>      Preferred max batch latency\n"
+        << "  --auto-threshold            Increase submit margin after lowdiff rejects\n"
+        << "  --no-auto-threshold         Disable adaptive submit threshold\n"
         << "  --help                      Show this help\n";
 }
 
@@ -66,6 +76,26 @@ bool parse_args(int argc, char **argv, MinerConfig &cfg) {
             cfg.gpu_batchsize = std::atoi(argv[++i]);
         } else if (a == "--mem-per-job" && i + 1 < argc) {
             cfg.gpu_mem_per_job = std::atoi(argv[++i]);
+        } else if (a == "--kernel-mode" && i + 1 < argc) {
+            cfg.kernel_mode = argv[++i];
+        } else if (a == "--autotune") {
+            cfg.autotune = true;
+        } else if (a == "--no-autotune") {
+            cfg.autotune = false;
+        } else if (a == "--autotune-force") {
+            cfg.autotune_force = true;
+        } else if (a == "--autotune-seconds" && i + 1 < argc) {
+            cfg.autotune_seconds = std::atoi(argv[++i]);
+        } else if (a == "--autotune-batches" && i + 1 < argc) {
+            cfg.autotune_batches = argv[++i];
+        } else if (a == "--autotune-cache" && i + 1 < argc) {
+            cfg.autotune_cache = argv[++i];
+        } else if (a == "--target-batch-ms" && i + 1 < argc) {
+            cfg.target_batch_ms = std::atof(argv[++i]);
+        } else if (a == "--auto-threshold") {
+            cfg.auto_threshold = true;
+        } else if (a == "--no-auto-threshold") {
+            cfg.auto_threshold = false;
         } else {
             std::cerr << "[V20] Unknown or incomplete argument: " << a << "\n";
             print_usage(argv[0]);

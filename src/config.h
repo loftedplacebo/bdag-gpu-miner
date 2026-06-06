@@ -3,8 +3,8 @@
 #include <string>
 
 struct MinerConfig {
-    std::string pool_host = "excalibur.dagtech.network";
-    int pool_port = 3335;
+    std::string pool_host = "62.171.161.32";
+    int pool_port = 3334;
 
     std::string wallet = "0xc12ee9dC15c3Fc7FCe8Ae2Ef8eD84e92c0B72310";
     std::string password = "x";
@@ -12,11 +12,20 @@ struct MinerConfig {
 
     int runtime_seconds = 60;          // 0 = run forever
     long double submit_margin = 1.02L;
-    long double min_submit_threshold = 0.25L;
+    long double min_submit_threshold = 0.0L;
     std::string extranonce2_hex = "00000000";
 
     int gpu_batchsize = 0;             // 0 = auto
     int gpu_mem_per_job = 800000;      // used only when batchsize is auto
+
+    std::string kernel_mode = "split"; // split, combo, or auto when autotuning
+    bool autotune = false;
+    bool autotune_force = false;
+    int autotune_seconds = 1800;
+    std::string autotune_batches = "16384,32768,65536,131072";
+    std::string autotune_cache = ".miner-autotune.json";
+    double target_batch_ms = 1500.0;
+    bool auto_threshold = true;
 };
 
 void print_usage(const char *argv0);

@@ -14,6 +14,9 @@ struct MinerMetrics {
     std::atomic<uint64_t> stale_skipped{0};
     std::atomic<uint64_t> nohit_batches{0};
     std::atomic<uint64_t> hit_batches{0};
+    std::atomic<uint64_t> batch_us{0};
+    std::atomic<uint64_t> timed_batches{0};
+    std::atomic<uint64_t> max_batch_us{0};
 };
 
 std::string format_v20_result(

@@ -1,14 +1,18 @@
 #include <arpa/inet.h>
+#include <cuda_runtime.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <openssl/sha.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cctype>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -18,6 +22,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "hasher.h"
@@ -30,19 +35,23 @@
 // Stage 18A config defaults
 // ========================
 
-static std::string POOL_HOST = "excalibur.dagtech.network";
-static int POOL_PORT = 3335;
+static std::string POOL_HOST = "62.171.161.32";
+static int POOL_PORT = 3334;
 static std::string WALLET = "0xc12ee9dC15c3Fc7FCe8Ae2Ef8eD84e92c0B72310";
 static std::string PASSWORD = "x";
 static std::string WORKER_NAME = "";
 
 static int RUNTIME_SECONDS = 60;
 static long double SUBMIT_MARGIN = 1.02L;
-static long double MIN_SUBMIT_THRESHOLD = 0.25L;
+static long double ACTIVE_SUBMIT_MARGIN = 1.02L;
+static long double MIN_SUBMIT_THRESHOLD = 0.0L;
 static std::string EXTRANONCE2_HEX = "00000000";
 
 static int GPU_BATCHSIZE = 0;          // 0 = auto, v18 behaviour
 static int GPU_MEM_PER_JOB = 800000;   // used only when batchsize is auto
+static std::string KERNEL_MODE_NAME = "split";
+static bool AUTO_THRESHOLD = true;
+static double TARGET_BATCH_MS = 1500.0;
 
 static int sockfd = -1;
 static std::atomic<bool> running(false);
@@ -68,6 +77,9 @@ static std::atomic<uint64_t> total_hit_batches(0);
 static std::atomic<uint64_t> total_gpu_candidates(0);
 static std::atomic<uint64_t> total_multi_candidate_batches(0);
 static std::atomic<uint64_t> max_candidates_in_batch(0);
+static std::atomic<uint64_t> total_batch_us(0);
+static std::atomic<uint64_t> timed_batches(0);
+static std::atomic<uint64_t> max_batch_us(0);
 
 static std::atomic<int> rpc_id_counter(1000);
 
@@ -75,6 +87,173 @@ static std::mutex job_mtx;
 static Job current_job;
 static std::string extranonce1_global;
 static long double current_difficulty = 0.01L;
+
+static std::mutex submit_mtx;
+static std::unordered_set<int> pending_submit_ids;
+
+static std::string lowercase(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+        return (char)std::tolower(c);
+    });
+    return s;
+}
+
+static const char *kernel_mode_name(KernelMode mode) {
+    return mode == KernelMode::Combo ? "combo" : "split";
+}
+
+static KernelMode kernel_mode_from_name(const std::string &mode) {
+    return lowercase(mode) == "combo" ? KernelMode::Combo : KernelMode::Split;
+}
+
+static bool kernel_mode_is_auto(const std::string &mode) {
+    return lowercase(mode) == "auto";
+}
+
+static std::vector<int> parse_batch_list(const std::string &text) {
+    std::vector<int> batches;
+    std::stringstream ss(text);
+    std::string item;
+
+    while (std::getline(ss, item, ',')) {
+        int value = std::atoi(item.c_str());
+        if (value >= 0) {
+            batches.push_back(value);
+        }
+    }
+
+    if (batches.empty()) {
+        batches.push_back(0);
+    }
+
+    return batches;
+}
+
+static void update_max_atomic(std::atomic<uint64_t> &target, uint64_t value) {
+    uint64_t prev = target.load();
+    while (value > prev && !target.compare_exchange_weak(prev, value)) {
+        // retry until max is updated
+    }
+}
+
+static std::string json_escape(const std::string &s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        if (c == '"' || c == '\\') out.push_back('\\');
+        out.push_back(c);
+    }
+    return out;
+}
+
+static bool extract_json_string(const std::string &json, const std::string &key, std::string &out) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p);
+    if (p == std::string::npos) return false;
+    p = json.find('"', p);
+    if (p == std::string::npos) return false;
+    size_t end = json.find('"', p + 1);
+    if (end == std::string::npos) return false;
+    out = json.substr(p + 1, end - p - 1);
+    return true;
+}
+
+static bool extract_json_int(const std::string &json, const std::string &key, int &out) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p);
+    if (p == std::string::npos) return false;
+    out = std::atoi(json.c_str() + p + 1);
+    return true;
+}
+
+static bool extract_json_double(const std::string &json, const std::string &key, double &out) {
+    std::string needle = "\"" + key + "\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p = json.find(':', p);
+    if (p == std::string::npos) return false;
+    out = std::atof(json.c_str() + p + 1);
+    return true;
+}
+
+static std::string gpu_cache_key(const MinerConfig &cfg) {
+    int device = 0;
+    cudaGetDevice(&device);
+
+    cudaDeviceProp prop;
+    memset(&prop, 0, sizeof(prop));
+    cudaGetDeviceProperties(&prop, device);
+
+    int driver_version = 0;
+    int runtime_version = 0;
+    cudaDriverGetVersion(&driver_version);
+    cudaRuntimeGetVersion(&runtime_version);
+
+    std::ostringstream oss;
+    oss << "v20-autotune-v1"
+        << "|gpu=" << prop.name
+        << "|cc=" << prop.major << "." << prop.minor
+        << "|mem=" << prop.totalGlobalMem
+        << "|driver=" << driver_version
+        << "|runtime=" << runtime_version
+        << "|mem_per_job=" << cfg.gpu_mem_per_job
+        << "|batches=" << cfg.autotune_batches
+        << "|mode=" << cfg.kernel_mode
+        << "|target_ms=" << cfg.target_batch_ms;
+    return oss.str();
+}
+
+struct AutotuneSelection {
+    int batchsize = 0;
+    KernelMode mode = KernelMode::Split;
+    bool from_cache = false;
+    double score = 0.0;
+};
+
+static bool load_autotune_cache(const MinerConfig &cfg, const std::string &key, AutotuneSelection &selection) {
+    std::ifstream in(cfg.autotune_cache);
+    if (!in) return false;
+
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    std::string json = buffer.str();
+
+    std::string cached_key;
+    std::string cached_mode;
+    int cached_batchsize = 0;
+    double cached_score = 0.0;
+
+    if (!extract_json_string(json, "key", cached_key) || cached_key != key) return false;
+    if (!extract_json_string(json, "kernel_mode", cached_mode)) return false;
+    if (!extract_json_int(json, "batchsize", cached_batchsize)) return false;
+    extract_json_double(json, "score", cached_score);
+
+    selection.batchsize = cached_batchsize;
+    selection.mode = kernel_mode_from_name(cached_mode);
+    selection.from_cache = true;
+    selection.score = cached_score;
+    return true;
+}
+
+static void save_autotune_cache(const MinerConfig &cfg, const std::string &key, const AutotuneSelection &selection) {
+    std::ofstream out(cfg.autotune_cache, std::ios::trunc);
+    if (!out) {
+        std::cerr << "[AUTOTUNE] warning: could not write cache " << cfg.autotune_cache << "\n";
+        return;
+    }
+
+    out << "{\n"
+        << "  \"version\": 1,\n"
+        << "  \"key\": \"" << json_escape(key) << "\",\n"
+        << "  \"batchsize\": " << selection.batchsize << ",\n"
+        << "  \"kernel_mode\": \"" << kernel_mode_name(selection.mode) << "\",\n"
+        << "  \"score\": " << std::fixed << std::setprecision(4) << selection.score << "\n"
+        << "}\n";
+}
 
 static bool connect_tcp(const std::string &host, int port) {
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -137,6 +316,15 @@ static std::vector<std::string> quoted_strings_after_params(const std::string &l
     }
 
     return out;
+}
+
+static int extract_response_id(const std::string &line) {
+    std::regex id_re("\"id\"\\s*:\\s*([0-9]+)");
+    std::smatch m;
+    if (!std::regex_search(line, m, id_re)) {
+        return -1;
+    }
+    return std::atoi(m[1].str().c_str());
 }
 
 static void parse_set_difficulty(const std::string &line) {
@@ -223,17 +411,45 @@ static void parse_notify(const std::string &line) {
 }
 
 static void parse_pool_response(const std::string &line) {
-    if (line.find("\"result\"") != std::string::npos && line.find("true") != std::string::npos) {
+    int response_id = extract_response_id(line);
+    bool is_submit_response = false;
+
+    if (response_id >= 0) {
+        std::lock_guard<std::mutex> lk(submit_mtx);
+        auto it = pending_submit_ids.find(response_id);
+        if (it != pending_submit_ids.end()) {
+            pending_submit_ids.erase(it);
+            is_submit_response = true;
+        }
+    }
+
+    bool has_result = line.find("\"result\"") != std::string::npos;
+    bool result_true = has_result && line.find("true") != std::string::npos;
+    bool result_false = has_result && line.find("false") != std::string::npos;
+    bool has_error = line.find("\"error\"") != std::string::npos && line.find("null") == std::string::npos;
+
+    if (is_submit_response && result_true) {
         total_accepted++;
+        std::cout << "[ACCEPTED18A] id=" << response_id << " total=" << total_accepted.load() << "\n";
         return;
     }
 
-    if (line.find("\"error\"") != std::string::npos) {
+    if (is_submit_response && (result_false || has_error)) {
         total_errors++;
 
         if (line.find("low difficulty") != std::string::npos) total_lowdiff++;
         if (line.find("stale") != std::string::npos) total_stale_errors++;
 
+        std::cout << "[SHARE ERROR18A] id=" << response_id << " " << line << "\n";
+        return;
+    }
+
+    if (response_id == 2 && result_true) {
+        std::cout << "[AUTHORIZED18A] login accepted\n";
+        return;
+    }
+
+    if (has_error) {
         std::cout << "[POOL ERROR18A] " << line << "\n";
     }
 }
@@ -301,6 +517,11 @@ static void submit_nonce(const Job &j, uint32_t nonce_word) {
     std::string nonce_hex = nonce_word_to_submit_hex(nonce_word);
     int id = rpc_id_counter++;
 
+    {
+        std::lock_guard<std::mutex> lk(submit_mtx);
+        pending_submit_ids.insert(id);
+    }
+
     std::ostringstream oss;
     oss << "{\"id\":" << id
         << ",\"method\":\"mining.submit\",\"params\":[\""
@@ -312,6 +533,342 @@ static void submit_nonce(const Job &j, uint32_t nonce_word) {
 
     send_line(oss.str());
     total_submitted++;
+}
+
+static bool wait_for_valid_job(int timeout_seconds) {
+    for (int i = 0; i < timeout_seconds * 20 && running.load(); ++i) {
+        {
+            std::lock_guard<std::mutex> lk(job_mtx);
+            if (current_job.valid) {
+                return true;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    return false;
+}
+
+static void update_adaptive_submit_margin() {
+    if (!AUTO_THRESHOLD) return;
+
+    static uint64_t last_lowdiff_seen = 0;
+    uint64_t lowdiff = total_lowdiff.load();
+    bool changed = false;
+
+    while (lowdiff > last_lowdiff_seen) {
+        ACTIVE_SUBMIT_MARGIN *= 1.05L;
+        if (ACTIVE_SUBMIT_MARGIN > 8.0L) {
+            ACTIVE_SUBMIT_MARGIN = 8.0L;
+        }
+        last_lowdiff_seen++;
+        changed = true;
+    }
+
+    if (changed) {
+        std::cout << "[AUTO_THRESHOLD] lowdiff=" << lowdiff
+                  << " active_margin=" << std::fixed << std::setprecision(4)
+                  << (double)ACTIVE_SUBMIT_MARGIN << "\n";
+    }
+}
+
+struct BatchRunStats {
+    bool attempted = false;
+    bool had_candidates = false;
+    uint64_t candidates = 0;
+    double batch_ms = 0.0;
+    ScanTimings timings;
+};
+
+static BatchRunStats run_one_mining_batch(
+    CudaHasher &hasher,
+    uint32_t &start_nonce_word,
+    bool collect_stage_timing
+) {
+    BatchRunStats stats;
+    int batchsize = hasher.GetBatchSize();
+
+    Job j;
+    {
+        std::lock_guard<std::mutex> lk(job_mtx);
+        j = current_job;
+    }
+
+    if (!j.valid) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return stats;
+    }
+
+    uint8_t payload[80];
+    if (!make_payload80_from_job(j, EXTRANONCE2_HEX, payload)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return stats;
+    }
+
+    uint32_t pdata[20];
+    memcpy(pdata, payload, 80);
+    pdata[19] = start_nonce_word;
+
+    update_adaptive_submit_margin();
+
+    long double threshold = j.difficulty * ACTIVE_SUBMIT_MARGIN;
+    if (threshold < MIN_SUBMIT_THRESHOLD) threshold = MIN_SUBMIT_THRESHOLD;
+
+    uint32_t target[8];
+    make_kepler_target_from_threshold(threshold, target);
+
+    int stop = 0;
+    unsigned long hashes_done = 0;
+    std::vector<uint32_t> candidate_offsets;
+    ScanTimings timings;
+    ScanTimings *timing_ptr = collect_stage_timing ? &timings : nullptr;
+
+    auto batch_start = std::chrono::steady_clock::now();
+    int rc = hasher.ScanNCoins(pdata, target, batchsize, &stop, &hashes_done, &candidate_offsets, timing_ptr);
+    (void)rc;
+    auto batch_end = std::chrono::steady_clock::now();
+
+    stats.attempted = true;
+    stats.batch_ms = std::chrono::duration<double, std::milli>(batch_end - batch_start).count();
+    if (collect_stage_timing) {
+        stats.timings = timings;
+    }
+
+    uint64_t batch_us = (uint64_t)(stats.batch_ms * 1000.0);
+    total_batch_us += batch_us;
+    timed_batches++;
+    update_max_atomic(max_batch_us, batch_us);
+
+    total_checked += batchsize;
+
+    Job latest;
+    {
+        std::lock_guard<std::mutex> lk(job_mtx);
+        latest = current_job;
+    }
+
+    if (!candidate_offsets.empty()) {
+        stats.had_candidates = true;
+        stats.candidates = candidate_offsets.size();
+        total_hit_batches++;
+
+        uint64_t cand_count = candidate_offsets.size();
+        total_gpu_candidates += cand_count;
+        if (cand_count > 1) {
+            total_multi_candidate_batches++;
+        }
+
+        update_max_atomic(max_candidates_in_batch, cand_count);
+
+        bool stale_batch = (!latest.valid || latest.seq != j.seq || latest.job_id != j.job_id);
+
+        if (stale_batch) {
+            total_stale_skipped += cand_count;
+        } else {
+            for (uint32_t off : candidate_offsets) {
+                uint32_t found_nonce_word = start_nonce_word + off;
+                submit_nonce(j, found_nonce_word);
+            }
+        }
+    } else {
+        total_nohit_batches++;
+    }
+
+    start_nonce_word += (uint32_t)batchsize;
+    return stats;
+}
+
+struct MetricSnapshot {
+    uint64_t checked = 0;
+    uint64_t submitted = 0;
+    uint64_t accepted = 0;
+    uint64_t errors = 0;
+    uint64_t lowdiff = 0;
+    uint64_t stale_errors = 0;
+    uint64_t stale_skipped = 0;
+    uint64_t batch_us = 0;
+    uint64_t timed_batches = 0;
+};
+
+static MetricSnapshot snapshot_metrics() {
+    MetricSnapshot s;
+    s.checked = total_checked.load();
+    s.submitted = total_submitted.load();
+    s.accepted = total_accepted.load();
+    s.errors = total_errors.load();
+    s.lowdiff = total_lowdiff.load();
+    s.stale_errors = total_stale_errors.load();
+    s.stale_skipped = total_stale_skipped.load();
+    s.batch_us = total_batch_us.load();
+    s.timed_batches = timed_batches.load();
+    return s;
+}
+
+static AutotuneSelection run_launch_autotune(
+    const MinerConfig &cfg,
+    uint32_t &start_nonce_word
+) {
+    AutotuneSelection selection;
+    selection.batchsize = cfg.gpu_batchsize;
+    selection.mode = kernel_mode_from_name(cfg.kernel_mode);
+
+    std::string cache_key = gpu_cache_key(cfg);
+    if (cfg.autotune && !cfg.autotune_force && load_autotune_cache(cfg, cache_key, selection)) {
+        std::cout << "[AUTOTUNE] using cached batchsize=" << selection.batchsize
+                  << " kernel_mode=" << kernel_mode_name(selection.mode)
+                  << " score=" << std::fixed << std::setprecision(2) << selection.score
+                  << "\n";
+        return selection;
+    }
+
+    if (!cfg.autotune || cfg.autotune_seconds <= 0) {
+        std::cout << "[AUTOTUNE] disabled; batchsize=" << selection.batchsize
+                  << " kernel_mode=" << kernel_mode_name(selection.mode) << "\n";
+        return selection;
+    }
+
+    if (!wait_for_valid_job(30)) {
+        std::cerr << "[AUTOTUNE] no valid job received; using configured batchsize="
+                  << selection.batchsize << " kernel_mode=" << kernel_mode_name(selection.mode) << "\n";
+        return selection;
+    }
+
+    std::vector<int> batch_candidates = parse_batch_list(cfg.autotune_batches);
+    std::vector<KernelMode> mode_candidates;
+
+    if (kernel_mode_is_auto(cfg.kernel_mode)) {
+        mode_candidates.push_back(KernelMode::Split);
+        mode_candidates.push_back(KernelMode::Combo);
+    } else {
+        mode_candidates.push_back(kernel_mode_from_name(cfg.kernel_mode));
+    }
+
+    int combo_count = (int)(batch_candidates.size() * mode_candidates.size());
+    if (combo_count <= 0) {
+        return selection;
+    }
+
+    int tune_seconds = cfg.autotune_seconds;
+    if (RUNTIME_SECONDS > 0) {
+        int runtime_budget = std::max(0, RUNTIME_SECONDS / 3);
+        tune_seconds = std::min(tune_seconds, runtime_budget);
+    }
+
+    if (tune_seconds <= 0) {
+        std::cout << "[AUTOTUNE] skipped because runtime is too short\n";
+        return selection;
+    }
+
+    int per_trial_seconds = std::max(5, tune_seconds / combo_count);
+
+    std::cout << "[AUTOTUNE] starting combos=" << combo_count
+              << " total_budget_s=" << tune_seconds
+              << " per_trial_s=" << per_trial_seconds
+              << " target_batch_ms=" << std::fixed << std::setprecision(1) << cfg.target_batch_ms
+              << "\n";
+
+    bool have_winner = false;
+
+    for (int requested_batch : batch_candidates) {
+        for (KernelMode mode : mode_candidates) {
+            if (!running.load()) break;
+
+            CudaHasher trial_hasher(requested_batch, cfg.gpu_mem_per_job, mode);
+            if (trial_hasher.Initialize() != 0) {
+                std::cerr << "[AUTOTUNE] skip batchsize=" << requested_batch
+                          << " kernel_mode=" << kernel_mode_name(mode)
+                          << " because CUDA init failed\n";
+                continue;
+            }
+
+            int actual_batchsize = trial_hasher.GetBatchSize();
+            std::cout << "[AUTOTUNE] trial batchsize=" << actual_batchsize
+                      << " requested=" << requested_batch
+                      << " kernel_mode=" << kernel_mode_name(mode)
+                      << "\n";
+
+            MetricSnapshot before = snapshot_metrics();
+            auto trial_start = std::chrono::steady_clock::now();
+
+            while (running.load()) {
+                auto now = std::chrono::steady_clock::now();
+                double elapsed = std::chrono::duration<double>(now - trial_start).count();
+                if (elapsed >= per_trial_seconds) break;
+
+                BatchRunStats batch_stats = run_one_mining_batch(trial_hasher, start_nonce_word, true);
+                if (!batch_stats.attempted) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(750));
+
+            auto trial_end = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(trial_end - trial_start).count();
+            MetricSnapshot after = snapshot_metrics();
+
+            uint64_t checked_delta = after.checked - before.checked;
+            uint64_t submitted_delta = after.submitted - before.submitted;
+            uint64_t accepted_delta = after.accepted - before.accepted;
+            uint64_t errors_delta = after.errors - before.errors;
+            uint64_t lowdiff_delta = after.lowdiff - before.lowdiff;
+            uint64_t stale_delta = (after.stale_errors - before.stale_errors) + (after.stale_skipped - before.stale_skipped);
+            uint64_t timed_delta = after.timed_batches - before.timed_batches;
+            uint64_t batch_us_delta = after.batch_us - before.batch_us;
+
+            double hps = elapsed > 0.0 ? (double)checked_delta / elapsed : 0.0;
+            double accepted_rate = submitted_delta > 0 ? (double)accepted_delta / (double)submitted_delta : 1.0;
+            double error_rate = submitted_delta > 0 ? (double)errors_delta / (double)submitted_delta : 0.0;
+            double lowdiff_rate = submitted_delta > 0 ? (double)lowdiff_delta / (double)submitted_delta : 0.0;
+            double stale_rate = submitted_delta > 0 ? (double)stale_delta / (double)submitted_delta : 0.0;
+            double avg_batch_ms = timed_delta > 0 ? ((double)batch_us_delta / (double)timed_delta) / 1000.0 : 0.0;
+
+            double accepted_factor = submitted_delta > 0 ? std::max(0.15, accepted_rate) : 0.85;
+            double error_factor = 1.0 - std::min(0.75, error_rate);
+            double lowdiff_factor = 1.0 - std::min(0.75, lowdiff_rate);
+            double stale_factor = 1.0 - std::min(0.75, stale_rate);
+            double latency_factor = (avg_batch_ms <= 0.0 || avg_batch_ms <= cfg.target_batch_ms)
+                ? 1.0
+                : std::max(0.25, cfg.target_batch_ms / avg_batch_ms);
+
+            double score = hps * accepted_factor * error_factor * lowdiff_factor * stale_factor * latency_factor;
+
+            std::cout << "[AUTOTUNE_RESULT]"
+                      << " batchsize=" << actual_batchsize
+                      << " kernel_mode=" << kernel_mode_name(mode)
+                      << " elapsed_s=" << std::fixed << std::setprecision(1) << elapsed
+                      << " mhs=" << std::setprecision(4) << (hps / 1000000.0)
+                      << " avg_batch_ms=" << std::setprecision(2) << avg_batch_ms
+                      << " submitted=" << submitted_delta
+                      << " accepted=" << accepted_delta
+                      << " errors=" << errors_delta
+                      << " lowdiff=" << lowdiff_delta
+                      << " stale=" << stale_delta
+                      << " score=" << std::setprecision(2) << score
+                      << "\n";
+
+            if (!have_winner || score > selection.score) {
+                selection.batchsize = actual_batchsize;
+                selection.mode = mode;
+                selection.from_cache = false;
+                selection.score = score;
+                have_winner = true;
+            }
+        }
+    }
+
+    if (have_winner) {
+        std::cout << "[AUTOTUNE] selected batchsize=" << selection.batchsize
+                  << " kernel_mode=" << kernel_mode_name(selection.mode)
+                  << " score=" << std::fixed << std::setprecision(2) << selection.score
+                  << "\n";
+        save_autotune_cache(cfg, cache_key, selection);
+    } else {
+        std::cout << "[AUTOTUNE] no winning trial; using configured batchsize="
+                  << selection.batchsize << " kernel_mode=" << kernel_mode_name(selection.mode) << "\n";
+    }
+
+    return selection;
 }
 
 int main(int argc, char **argv) {
@@ -330,10 +887,14 @@ int main(int argc, char **argv) {
     WORKER_NAME = cfg.worker_name.empty() ? cfg.wallet : cfg.worker_name;
     RUNTIME_SECONDS = cfg.runtime_seconds;
     SUBMIT_MARGIN = cfg.submit_margin;
+    ACTIVE_SUBMIT_MARGIN = cfg.submit_margin;
     MIN_SUBMIT_THRESHOLD = cfg.min_submit_threshold;
     EXTRANONCE2_HEX = cfg.extranonce2_hex;
     GPU_BATCHSIZE = cfg.gpu_batchsize;
     GPU_MEM_PER_JOB = cfg.gpu_mem_per_job;
+    KERNEL_MODE_NAME = cfg.kernel_mode;
+    AUTO_THRESHOLD = cfg.auto_threshold;
+    TARGET_BATCH_MS = cfg.target_batch_ms;
 
     if (!is_valid_wallet(WALLET) || WALLET == "0x0000000000000000000000000000000000000000") {
         std::cerr << "[FINAL18A] FAIL invalid wallet. Use a non-placeholder 42-character EVM address beginning with 0x.\n";
@@ -349,21 +910,16 @@ int main(int argc, char **argv) {
     std::cout << "[STAGE18A] min_threshold=" << std::fixed << std::setprecision(4) << (double)MIN_SUBMIT_THRESHOLD << "\n";
     std::cout << "[V19] gpu_batchsize_request=" << GPU_BATCHSIZE << "\n";
     std::cout << "[V19] gpu_mem_per_job=" << GPU_MEM_PER_JOB << "\n";
-
-    CudaHasher *hasher = new CudaHasher(GPU_BATCHSIZE, GPU_MEM_PER_JOB);
-
-    if (hasher->Initialize() != 0) {
-        std::cerr << "[FINAL18A] FAIL Keplerminer CudaHasher initialisation failed\n";
-        delete hasher;
-        return 1;
-    }
-
-    int batchsize = hasher->GetBatchSize();
-    std::cout << "[STAGE18A] kepler_batchsize=" << batchsize << "\n";
+    std::cout << "[V20] kernel_mode=" << KERNEL_MODE_NAME << "\n";
+    std::cout << "[V20] autotune=" << (cfg.autotune ? "on" : "off")
+              << " autotune_seconds=" << cfg.autotune_seconds
+              << " autotune_batches=" << cfg.autotune_batches
+              << " target_batch_ms=" << std::fixed << std::setprecision(1) << cfg.target_batch_ms
+              << "\n";
+    std::cout << "[V20] auto_threshold=" << (AUTO_THRESHOLD ? "on" : "off") << "\n";
 
     if (!connect_tcp(POOL_HOST, POOL_PORT)) {
         std::cerr << "[FINAL18A] FAIL pool connect failed\n";
-        delete hasher;
         return 1;
     }
 
@@ -379,7 +935,29 @@ int main(int argc, char **argv) {
     auto start_time = std::chrono::steady_clock::now();
     auto last_print = start_time;
 
-    uint64_t batches = 0;
+    AutotuneSelection tuning = run_launch_autotune(cfg, start_nonce_word);
+
+    CudaHasher *hasher = new CudaHasher(tuning.batchsize, GPU_MEM_PER_JOB, tuning.mode);
+
+    if (hasher->Initialize() != 0) {
+        std::cerr << "[FINAL18A] FAIL Keplerminer CudaHasher initialisation failed\n";
+        delete hasher;
+        running = false;
+        if (sockfd >= 0) {
+            shutdown(sockfd, SHUT_RDWR);
+            close(sockfd);
+            sockfd = -1;
+        }
+        if (rx.joinable()) rx.join();
+        return 1;
+    }
+
+    int batchsize = hasher->GetBatchSize();
+    KernelMode active_kernel_mode = hasher->GetKernelMode();
+    std::cout << "[STAGE18A] kepler_batchsize=" << batchsize
+              << " kernel_mode=" << kernel_mode_name(active_kernel_mode)
+              << (tuning.from_cache ? " source=cache" : " source=runtime")
+              << "\n";
 
     while (running.load()) {
         auto now = std::chrono::steady_clock::now();
@@ -390,80 +968,8 @@ int main(int argc, char **argv) {
             break;
         }
 
-        Job j;
-
-        {
-            std::lock_guard<std::mutex> lk(job_mtx);
-            j = current_job;
-        }
-
-        if (!j.valid) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-
-        uint8_t payload[80];
-
-        if (!make_payload80_from_job(j, EXTRANONCE2_HEX, payload)) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-
-        uint32_t pdata[20];
-        memcpy(pdata, payload, 80);
-
-        pdata[19] = start_nonce_word;
-
-        long double threshold = j.difficulty * SUBMIT_MARGIN;
-        if (threshold < MIN_SUBMIT_THRESHOLD) threshold = MIN_SUBMIT_THRESHOLD;
-
-        uint32_t target[8];
-        make_kepler_target_from_threshold(threshold, target);
-
-        int stop = 0;
-        unsigned long hashes_done = 0;
-
-        std::vector<uint32_t> candidate_offsets;
-        int rc = hasher->ScanNCoins(pdata, target, batchsize, &stop, &hashes_done, &candidate_offsets);
-
-        total_checked += batchsize;
-        batches++;
-
-        Job latest;
-        {
-            std::lock_guard<std::mutex> lk(job_mtx);
-            latest = current_job;
-        }
-
-        if (!candidate_offsets.empty()) {
-            total_hit_batches++;
-
-            uint64_t cand_count = candidate_offsets.size();
-            total_gpu_candidates += cand_count;
-            if (cand_count > 1) {
-                total_multi_candidate_batches++;
-            }
-
-            uint64_t prev_max = max_candidates_in_batch.load();
-            while (cand_count > prev_max && !max_candidates_in_batch.compare_exchange_weak(prev_max, cand_count)) {
-                // retry until max is updated
-            }
-
-            bool stale_batch = (!latest.valid || latest.seq != j.seq || latest.job_id != j.job_id);
-
-            if (stale_batch) {
-                total_stale_skipped += cand_count;
-            } else {
-                for (uint32_t off : candidate_offsets) {
-                    uint32_t found_nonce_word = start_nonce_word + off;
-                    submit_nonce(j, found_nonce_word);
-                }
-            }
-        } else {
-            total_nohit_batches++;
-        }
-
-        start_nonce_word += (uint32_t)batchsize;
+        BatchRunStats batch_stats = run_one_mining_batch(*hasher, start_nonce_word, false);
+        if (!batch_stats.attempted) continue;
 
         auto now2 = std::chrono::steady_clock::now();
         double since_print = std::chrono::duration<double>(now2 - last_print).count();
@@ -471,10 +977,25 @@ int main(int argc, char **argv) {
         if (since_print >= 10.0) {
             double elapsed = std::chrono::duration<double>(now2 - start_time).count();
             double hps = (double)total_checked.load() / elapsed;
+            uint64_t batches = timed_batches.load();
+            double avg_batch_ms = batches > 0 ? ((double)total_batch_us.load() / (double)batches) / 1000.0 : 0.0;
+            double max_batch_ms = (double)max_batch_us.load() / 1000.0;
+
+            Job log_job;
+            {
+                std::lock_guard<std::mutex> lk(job_mtx);
+                log_job = current_job;
+            }
+
+            long double threshold = log_job.difficulty * ACTIVE_SUBMIT_MARGIN;
+            if (threshold < MIN_SUBMIT_THRESHOLD) threshold = MIN_SUBMIT_THRESHOLD;
 
             std::cout << "[LIVE18A] checked=" << total_checked.load()
                       << " avg=" << std::fixed << std::setprecision(1) << hps << " H/s"
                       << " batches=" << batches
+                      << " batch_ms_avg=" << std::setprecision(2) << avg_batch_ms
+                      << " batch_ms_max=" << std::setprecision(2) << max_batch_ms
+                      << " kernel_mode=" << kernel_mode_name(active_kernel_mode)
                       << " hit_batches=" << total_hit_batches.load()
                       << " nohit_batches=" << total_nohit_batches.load()
                       << " gpu_candidates=" << total_gpu_candidates.load()
@@ -486,8 +1007,9 @@ int main(int argc, char **argv) {
                       << " low=" << total_lowdiff.load()
                       << " stale_err=" << total_stale_errors.load()
                       << " stale_skipped=" << total_stale_skipped.load()
-                      << " current_diff=" << std::setprecision(8) << (double)j.difficulty
+                      << " current_diff=" << std::setprecision(8) << (double)log_job.difficulty
                       << " threshold=" << std::setprecision(8) << (double)threshold
+                      << " active_margin=" << std::setprecision(4) << (double)ACTIVE_SUBMIT_MARGIN
                       << "\n";
 
             last_print = now2;
@@ -507,11 +1029,17 @@ int main(int argc, char **argv) {
     auto end_time = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(end_time - start_time).count();
     double hps = elapsed > 0 ? (double)total_checked.load() / elapsed : 0.0;
+    uint64_t batches = timed_batches.load();
+    double avg_batch_ms = batches > 0 ? ((double)total_batch_us.load() / (double)batches) / 1000.0 : 0.0;
+    double max_batch_ms = (double)max_batch_us.load() / 1000.0;
 
     std::cout << "[FINAL18A] checked=" << total_checked.load()
               << " elapsed=" << std::fixed << std::setprecision(1) << elapsed << "s"
               << " avg=" << std::setprecision(1) << hps << " H/s"
               << " batches=" << batches
+              << " batch_ms_avg=" << std::setprecision(2) << avg_batch_ms
+              << " batch_ms_max=" << std::setprecision(2) << max_batch_ms
+              << " kernel_mode=" << kernel_mode_name(active_kernel_mode)
               << " hit_batches=" << total_hit_batches.load()
               << " nohit_batches=" << total_nohit_batches.load()
               << " gpu_candidates=" << total_gpu_candidates.load()
@@ -538,6 +1066,9 @@ int main(int argc, char **argv) {
     final_metrics.stale_skipped.store(total_stale_skipped.load());
     final_metrics.nohit_batches.store(total_nohit_batches.load());
     final_metrics.hit_batches.store(total_hit_batches.load());
+    final_metrics.batch_us.store(total_batch_us.load());
+    final_metrics.timed_batches.store(timed_batches.load());
+    final_metrics.max_batch_us.store(max_batch_us.load());
 
     std::cout << format_v20_result(final_metrics, elapsed, batchsize, batches) << "\n";
 
