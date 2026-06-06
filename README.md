@@ -132,7 +132,11 @@ After the first successful tune, set `AUTOTUNE_FORCE=0` so the miner reuses `.mi
 
 With `AUTOTUNE=1`, the miner tests configured batch sizes and split/combo kernel modes on launch. It scores candidates by hashrate, accepted share rate, rejects, stale work, and batch latency.
 
-The winning result is written to `.miner-autotune.json` only after meaningful completed trials. If the pool disconnects during autotune, the current candidate is marked failed, the miner reconnects and retries, and partial results are written to `.miner-autotune.failed.json` for debugging instead of being reused.
+The winning result is written to `.miner-autotune.json` only after meaningful completed trials. The cache stays small for fast startup and includes a `summary_file` pointer to the full decision report, for example `logs/autotune_summary_YYYYMMDD_HHMMSS.json`.
+
+Each successful autotune also writes a side-by-side JSON and text report under `logs/`. The report includes every tested batch/kernel candidate, raw hashrate, accepted/submitted shares per second, stale and low-difficulty rates, batch latency, score components, penalties, and a plain-English reason for the selected winner.
+
+If the pool disconnects during autotune, the current candidate is marked failed, the miner reconnects and retries, and partial results are written to `.miner-autotune.failed.json` for debugging instead of being reused.
 
 The cache is ignored unless it is marked `valid`, matches the current GPU/config key, was derived from the configured `AUTOTUNE_BATCHES`, and completed enough candidate testing. Later starts reuse the valid cache unless `AUTOTUNE_FORCE=1` is set.
 

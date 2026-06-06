@@ -4,10 +4,12 @@
 #include <netinet/in.h>
 #include <openssl/sha.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cctype>
@@ -16,6 +18,8 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <cmath>
 #include <mutex>
 #include <random>
 #include <regex>
@@ -215,6 +219,36 @@ static std::string current_timestamp_utc() {
     return std::string(buf);
 }
 
+static std::string current_timestamp_compact_utc() {
+    std::time_t now = std::time(nullptr);
+    std::tm tm_utc;
+    gmtime_r(&now, &tm_utc);
+
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y%m%d_%H%M%S", &tm_utc);
+    return std::string(buf);
+}
+
+static bool ensure_logs_dir() {
+    if (mkdir("logs", 0755) == 0) {
+        return true;
+    }
+    return errno == EEXIST;
+}
+
+static std::string join_reason_parts(const std::vector<std::string> &parts) {
+    if (parts.empty()) {
+        return "none";
+    }
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) oss << ",";
+        oss << parts[i];
+    }
+    return oss.str();
+}
+
 static bool contains_batch_request(const std::vector<int> &batches, int requested_batchsize) {
     return std::find(batches.begin(), batches.end(), requested_batchsize) != batches.end();
 }
@@ -263,6 +297,9 @@ struct AutotuneSelection {
     double trial_elapsed_s = 0.0;
     int intended_trial_seconds = 0;
     int completed_candidates = 0;
+    std::string summary_file;
+    std::string summary_text_file;
+    std::string explanation;
 };
 
 struct AutotuneCandidateResult {
@@ -275,15 +312,32 @@ struct AutotuneCandidateResult {
     double elapsed_s = 0.0;
     double required_s = 0.0;
     int intended_trial_seconds = 0;
-    double mhs = 0.0;
+    uint64_t hashes_checked = 0;
+    double hashrate_hs = 0.0;
+    double hashrate_mhs = 0.0;
     double avg_batch_ms = 0.0;
+    double max_batch_ms = 0.0;
     uint64_t submitted = 0;
     uint64_t accepted = 0;
     uint64_t errors = 0;
-    uint64_t lowdiff = 0;
-    uint64_t stale = 0;
+    uint64_t lowdiff_errors = 0;
+    uint64_t stale_errors = 0;
+    uint64_t stale_skipped = 0;
+    double accepted_per_sec = 0.0;
+    double submitted_per_sec = 0.0;
+    double acceptance_rate = 0.0;
+    double stale_rate = 0.0;
+    double lowdiff_rate = 0.0;
+    double base_score = 0.0;
+    double useful_hashrate_score = 0.0;
+    double stale_penalty = 0.0;
+    double lowdiff_penalty = 0.0;
+    double error_penalty = 0.0;
+    double latency_penalty = 0.0;
+    double final_score = 0.0;
     double score = 0.0;
     std::string reason;
+    std::string penalties_applied;
 };
 
 static AutotuneSelection safe_autotune_fallback() {
@@ -321,6 +375,9 @@ static bool load_autotune_cache(const MinerConfig &cfg, const std::string &key, 
     int cached_intended_trial_seconds = 0;
     double cached_score = 0.0;
     double cached_trial_elapsed_s = 0.0;
+    std::string cached_summary_file;
+    std::string cached_summary_text_file;
+    std::string cached_explanation;
 
     size_t valid_pos = json.find("\"valid\"");
     size_t tested_candidates_pos = json.find("\"tested_candidates\"");
@@ -387,6 +444,22 @@ static bool load_autotune_cache(const MinerConfig &cfg, const std::string &key, 
     }
 
     extract_json_double(json, "score", cached_score);
+    if (!extract_json_string(json, "summary_file", cached_summary_file) || cached_summary_file.empty()) {
+        reason = "cache_missing_summary_file";
+        return false;
+    }
+    {
+        std::ifstream report_check(cached_summary_file);
+        if (!report_check) {
+            reason = "cache_summary_file_missing";
+            return false;
+        }
+    }
+    extract_json_string(json, "summary_text_file", cached_summary_text_file);
+    if (!extract_json_string(json, "selection_reason", cached_explanation) || cached_explanation.empty()) {
+        reason = "cache_missing_selection_reason";
+        return false;
+    }
 
     selection.batchsize = cached_batchsize;
     selection.requested_batchsize = cached_requested_batchsize;
@@ -397,6 +470,9 @@ static bool load_autotune_cache(const MinerConfig &cfg, const std::string &key, 
     selection.trial_elapsed_s = cached_trial_elapsed_s;
     selection.intended_trial_seconds = cached_intended_trial_seconds;
     selection.completed_candidates = cached_completed_candidates;
+    selection.summary_file = cached_summary_file;
+    selection.summary_text_file = cached_summary_text_file;
+    selection.explanation = cached_explanation;
     return true;
 }
 
@@ -404,6 +480,7 @@ static void write_candidate_json(std::ostream &out, const AutotuneCandidateResul
     out << indent << "{\n"
         << indent << "  \"requested_batchsize\": " << c.requested_batchsize << ",\n"
         << indent << "  \"actual_batchsize\": " << c.actual_batchsize << ",\n"
+        << indent << "  \"aligned_batchsize\": " << c.actual_batchsize << ",\n"
         << indent << "  \"kernel_mode\": \"" << kernel_mode_name(c.mode) << "\",\n"
         << indent << "  \"valid\": " << (c.valid ? "true" : "false") << ",\n"
         << indent << "  \"disconnected\": " << (c.disconnected ? "true" : "false") << ",\n"
@@ -411,23 +488,314 @@ static void write_candidate_json(std::ostream &out, const AutotuneCandidateResul
         << indent << "  \"elapsed_s\": " << std::fixed << std::setprecision(3) << c.elapsed_s << ",\n"
         << indent << "  \"required_s\": " << std::fixed << std::setprecision(3) << c.required_s << ",\n"
         << indent << "  \"intended_trial_seconds\": " << c.intended_trial_seconds << ",\n"
-        << indent << "  \"mhs\": " << std::fixed << std::setprecision(6) << c.mhs << ",\n"
+        << indent << "  \"hashes_checked\": " << c.hashes_checked << ",\n"
+        << indent << "  \"hashrate_hs\": " << std::fixed << std::setprecision(3) << c.hashrate_hs << ",\n"
+        << indent << "  \"hashrate_mhs\": " << std::fixed << std::setprecision(6) << c.hashrate_mhs << ",\n"
         << indent << "  \"avg_batch_ms\": " << std::fixed << std::setprecision(3) << c.avg_batch_ms << ",\n"
+        << indent << "  \"max_batch_ms\": " << std::fixed << std::setprecision(3) << c.max_batch_ms << ",\n"
         << indent << "  \"submitted\": " << c.submitted << ",\n"
         << indent << "  \"accepted\": " << c.accepted << ",\n"
         << indent << "  \"errors\": " << c.errors << ",\n"
-        << indent << "  \"lowdiff\": " << c.lowdiff << ",\n"
-        << indent << "  \"stale\": " << c.stale << ",\n"
+        << indent << "  \"lowdiff_errors\": " << c.lowdiff_errors << ",\n"
+        << indent << "  \"stale_errors\": " << c.stale_errors << ",\n"
+        << indent << "  \"stale_skipped\": " << c.stale_skipped << ",\n"
+        << indent << "  \"accepted_per_sec\": " << std::fixed << std::setprecision(6) << c.accepted_per_sec << ",\n"
+        << indent << "  \"submitted_per_sec\": " << std::fixed << std::setprecision(6) << c.submitted_per_sec << ",\n"
+        << indent << "  \"acceptance_rate\": " << std::fixed << std::setprecision(6) << c.acceptance_rate << ",\n"
+        << indent << "  \"stale_rate\": " << std::fixed << std::setprecision(6) << c.stale_rate << ",\n"
+        << indent << "  \"lowdiff_rate\": " << std::fixed << std::setprecision(6) << c.lowdiff_rate << ",\n"
+        << indent << "  \"base_score\": " << std::fixed << std::setprecision(4) << c.base_score << ",\n"
+        << indent << "  \"useful_hashrate_score\": " << std::fixed << std::setprecision(4) << c.useful_hashrate_score << ",\n"
+        << indent << "  \"stale_penalty\": " << std::fixed << std::setprecision(4) << c.stale_penalty << ",\n"
+        << indent << "  \"lowdiff_penalty\": " << std::fixed << std::setprecision(4) << c.lowdiff_penalty << ",\n"
+        << indent << "  \"error_penalty\": " << std::fixed << std::setprecision(4) << c.error_penalty << ",\n"
+        << indent << "  \"latency_penalty\": " << std::fixed << std::setprecision(4) << c.latency_penalty << ",\n"
+        << indent << "  \"final_score\": " << std::fixed << std::setprecision(4) << c.final_score << ",\n"
         << indent << "  \"score\": " << std::fixed << std::setprecision(4) << c.score << ",\n"
+        << indent << "  \"penalties_applied\": \"" << json_escape(c.penalties_applied) << "\",\n"
         << indent << "  \"reason\": \"" << json_escape(c.reason) << "\"\n"
         << indent << "}";
+}
+
+struct AutotuneReportFiles {
+    std::string json_path;
+    std::string text_path;
+};
+
+static const AutotuneCandidateResult *find_selected_candidate(
+    const AutotuneSelection &selection,
+    const std::vector<AutotuneCandidateResult> &tested_candidates
+) {
+    const AutotuneCandidateResult *selected = nullptr;
+    double closest_score_delta = std::numeric_limits<double>::max();
+
+    for (const AutotuneCandidateResult &c : tested_candidates) {
+        if (!c.valid) continue;
+        if (c.actual_batchsize != selection.batchsize) continue;
+        if (c.requested_batchsize != selection.requested_batchsize) continue;
+        if (c.mode != selection.mode) continue;
+
+        double score_delta = std::fabs(c.final_score - selection.score);
+        if (score_delta < closest_score_delta) {
+            closest_score_delta = score_delta;
+            selected = &c;
+        }
+    }
+
+    return selected;
+}
+
+static std::string explain_autotune_selection(
+    const MinerConfig &cfg,
+    const AutotuneSelection &selection,
+    const std::vector<AutotuneCandidateResult> &tested_candidates
+) {
+    const AutotuneCandidateResult *selected = find_selected_candidate(selection, tested_candidates);
+    if (!selected) {
+        return "Selected because it had the highest final autotune score among valid candidates.";
+    }
+
+    const AutotuneCandidateResult *best_raw = nullptr;
+    const AutotuneCandidateResult *best_accepted = nullptr;
+    bool higher_raw_candidate_penalized = false;
+    bool latency_filtered_higher_raw = false;
+
+    for (const AutotuneCandidateResult &c : tested_candidates) {
+        if (!c.valid) continue;
+        if (!best_raw || c.hashrate_hs > best_raw->hashrate_hs) best_raw = &c;
+        if (!best_accepted || c.accepted_per_sec > best_accepted->accepted_per_sec) best_accepted = &c;
+
+        if (&c != selected && c.hashrate_hs > selected->hashrate_hs * 1.01 && c.final_score < selected->final_score) {
+            higher_raw_candidate_penalized = true;
+            if (c.avg_batch_ms > cfg.target_batch_ms && selected->avg_batch_ms <= cfg.target_batch_ms) {
+                latency_filtered_higher_raw = true;
+            }
+        }
+    }
+
+    if (best_accepted == selected && selected->accepted_per_sec > 0.0) {
+        return "Selected because it had the highest accepted shares per second after stale, low-difficulty, error, and latency penalties.";
+    }
+
+    if (latency_filtered_higher_raw) {
+        return "Selected because higher raw hashrate candidates exceeded target batch latency and lost score to stale/latency risk.";
+    }
+
+    if (higher_raw_candidate_penalized || (best_raw && best_raw != selected)) {
+        return "Selected because higher raw hashrate candidates had worse stale, low-difficulty, error, or latency penalties.";
+    }
+
+    if (selected->avg_batch_ms <= cfg.target_batch_ms) {
+        return "Selected because it was the best final score within target batch latency.";
+    }
+
+    return "Selected because it had the best useful hashrate after stale, low-difficulty, error, and latency penalties.";
+}
+
+static bool is_selected_candidate(
+    const AutotuneCandidateResult &candidate,
+    const AutotuneCandidateResult *selected
+) {
+    return selected && &candidate == selected;
+}
+
+static void print_autotune_summary(
+    const AutotuneSelection &selection,
+    const std::vector<AutotuneCandidateResult> &tested_candidates,
+    const AutotuneReportFiles &report_files
+) {
+    const AutotuneCandidateResult *selected = find_selected_candidate(selection, tested_candidates);
+
+    std::cout << "[AUTOTUNE_SUMMARY]\n";
+    std::cout << "[AUTOTUNE_FORMULA] final_score = useful_hashrate_score - stale_penalty - lowdiff_penalty - error_penalty - latency_penalty\n";
+
+    for (const AutotuneCandidateResult &c : tested_candidates) {
+        std::cout << "candidate"
+                  << " requested_batch=" << c.requested_batchsize
+                  << " batch=" << c.actual_batchsize
+                  << " mode=" << kernel_mode_name(c.mode)
+                  << " valid=" << (c.valid ? "true" : "false")
+                  << " elapsed_s=" << std::fixed << std::setprecision(1) << c.elapsed_s
+                  << " hashes_checked=" << c.hashes_checked
+                  << " mhs=" << std::setprecision(4) << c.hashrate_mhs
+                  << " accepted_per_sec=" << std::setprecision(6) << c.accepted_per_sec
+                  << " submitted_per_sec=" << std::setprecision(6) << c.submitted_per_sec
+                  << " acceptance_rate=" << std::setprecision(2) << (c.acceptance_rate * 100.0) << "%"
+                  << " stale_rate=" << std::setprecision(2) << (c.stale_rate * 100.0) << "%"
+                  << " lowdiff_rate=" << std::setprecision(2) << (c.lowdiff_rate * 100.0) << "%"
+                  << " batch_ms_avg=" << std::setprecision(2) << c.avg_batch_ms
+                  << " batch_ms_max=" << std::setprecision(2) << c.max_batch_ms
+                  << " base_score=" << std::setprecision(2) << c.base_score
+                  << " stale_penalty=" << std::setprecision(2) << c.stale_penalty
+                  << " lowdiff_penalty=" << std::setprecision(2) << c.lowdiff_penalty
+                  << " error_penalty=" << std::setprecision(2) << c.error_penalty
+                  << " latency_penalty=" << std::setprecision(2) << c.latency_penalty
+                  << " score=" << std::setprecision(2) << c.final_score
+                  << " reason=" << c.reason
+                  << " penalties=" << c.penalties_applied
+                  << (is_selected_candidate(c, selected) ? " SELECTED" : "")
+                  << "\n";
+    }
+
+    if (selection.valid) {
+        std::cout << "[AUTOTUNE_SELECTED] batchsize=" << selection.batchsize
+                  << " requested_batchsize=" << selection.requested_batchsize
+                  << " kernel_mode=" << kernel_mode_name(selection.mode)
+                  << " score=" << std::fixed << std::setprecision(2) << selection.score
+                  << " reason=\"" << selection.explanation << "\"\n";
+    }
+
+    if (!report_files.json_path.empty()) {
+        std::cout << "[AUTOTUNE_REPORT] json=" << report_files.json_path
+                  << " text=" << report_files.text_path << "\n";
+    }
+}
+
+static void write_autotune_text_report(
+    std::ostream &out,
+    const MinerConfig &cfg,
+    const std::string &key,
+    const AutotuneSelection &selection,
+    const std::vector<AutotuneCandidateResult> &tested_candidates
+) {
+    const AutotuneCandidateResult *selected = find_selected_candidate(selection, tested_candidates);
+
+    out << "BDAG GPU Miner Autotune Summary\n";
+    out << "Generated: " << current_timestamp_utc() << "\n";
+    out << "Pool: " << cfg.pool_host << ":" << cfg.pool_port << "\n";
+    out << "Key: " << key << "\n";
+    out << "Autotune seconds: " << cfg.autotune_seconds << "\n";
+    out << "Target batch ms: " << std::fixed << std::setprecision(1) << cfg.target_batch_ms << "\n\n";
+    out << "Formula: final_score = useful_hashrate_score - stale_penalty - lowdiff_penalty - error_penalty - latency_penalty\n";
+    out << "Useful hashrate score is raw hashrate weighted by observed share acceptance quality.\n\n";
+
+    out << "Selected: batchsize=" << selection.batchsize
+        << " requested_batchsize=" << selection.requested_batchsize
+        << " kernel_mode=" << kernel_mode_name(selection.mode)
+        << " score=" << std::fixed << std::setprecision(4) << selection.score << "\n";
+    out << "Reason: " << selection.explanation << "\n\n";
+
+    out << std::left
+        << std::setw(10) << "selected"
+        << std::setw(10) << "valid"
+        << std::setw(10) << "request"
+        << std::setw(10) << "actual"
+        << std::setw(8) << "mode"
+        << std::setw(10) << "mhs"
+        << std::setw(15) << "accepted_s"
+        << std::setw(15) << "submitted_s"
+        << std::setw(12) << "accept_%"
+        << std::setw(10) << "stale_%"
+        << std::setw(12) << "lowdiff_%"
+        << std::setw(12) << "avg_ms"
+        << std::setw(12) << "max_ms"
+        << std::setw(14) << "base"
+        << std::setw(14) << "useful"
+        << std::setw(14) << "stale_pen"
+        << std::setw(14) << "low_pen"
+        << std::setw(14) << "err_pen"
+        << std::setw(14) << "lat_pen"
+        << std::setw(14) << "final"
+        << "reason\n";
+
+    for (const AutotuneCandidateResult &c : tested_candidates) {
+        out << std::left
+            << std::setw(10) << (is_selected_candidate(c, selected) ? "yes" : "")
+            << std::setw(10) << (c.valid ? "true" : "false")
+            << std::setw(10) << c.requested_batchsize
+            << std::setw(10) << c.actual_batchsize
+            << std::setw(8) << kernel_mode_name(c.mode)
+            << std::setw(10) << std::fixed << std::setprecision(4) << c.hashrate_mhs
+            << std::setw(15) << std::fixed << std::setprecision(6) << c.accepted_per_sec
+            << std::setw(15) << std::fixed << std::setprecision(6) << c.submitted_per_sec
+            << std::setw(12) << std::fixed << std::setprecision(2) << (c.acceptance_rate * 100.0)
+            << std::setw(10) << std::fixed << std::setprecision(2) << (c.stale_rate * 100.0)
+            << std::setw(12) << std::fixed << std::setprecision(2) << (c.lowdiff_rate * 100.0)
+            << std::setw(12) << std::fixed << std::setprecision(2) << c.avg_batch_ms
+            << std::setw(12) << std::fixed << std::setprecision(2) << c.max_batch_ms
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.base_score
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.useful_hashrate_score
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.stale_penalty
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.lowdiff_penalty
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.error_penalty
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.latency_penalty
+            << std::setw(14) << std::fixed << std::setprecision(2) << c.final_score
+            << c.reason << " penalties=" << c.penalties_applied << "\n";
+    }
+}
+
+static bool write_autotune_report(
+    const MinerConfig &cfg,
+    const std::string &key,
+    const AutotuneSelection &selection,
+    const std::vector<AutotuneCandidateResult> &tested_candidates,
+    AutotuneReportFiles &report_files
+) {
+    if (!ensure_logs_dir()) {
+        std::cerr << "[AUTOTUNE] warning: could not create logs directory\n";
+        return false;
+    }
+
+    std::string timestamp = current_timestamp_compact_utc();
+    report_files.json_path = "logs/autotune_summary_" + timestamp + ".json";
+    report_files.text_path = "logs/autotune_summary_" + timestamp + ".txt";
+
+    {
+        std::ofstream out(report_files.json_path, std::ios::trunc);
+        if (!out) {
+            std::cerr << "[AUTOTUNE] warning: could not write report " << report_files.json_path << "\n";
+            report_files = AutotuneReportFiles();
+            return false;
+        }
+
+        const AutotuneCandidateResult *selected_candidate = find_selected_candidate(selection, tested_candidates);
+        out << "{\n"
+            << "  \"version\": 1,\n"
+            << "  \"generated_at\": \"" << current_timestamp_utc() << "\",\n"
+            << "  \"key\": \"" << json_escape(key) << "\",\n"
+            << "  \"pool\": \"" << json_escape(cfg.pool_host) << ":" << cfg.pool_port << "\",\n"
+            << "  \"autotune_seconds\": " << cfg.autotune_seconds << ",\n"
+            << "  \"target_batch_ms\": " << std::fixed << std::setprecision(3) << cfg.target_batch_ms << ",\n"
+            << "  \"scoring_formula\": \"final_score = useful_hashrate_score - stale_penalty - lowdiff_penalty - error_penalty - latency_penalty\",\n"
+            << "  \"selection_reason\": \"" << json_escape(selection.explanation) << "\",\n"
+            << "  \"selected\": {\n"
+            << "    \"requested_batchsize\": " << selection.requested_batchsize << ",\n"
+            << "    \"actual_batchsize\": " << selection.batchsize << ",\n"
+            << "    \"kernel_mode\": \"" << kernel_mode_name(selection.mode) << "\",\n"
+            << "    \"score\": " << std::fixed << std::setprecision(4) << selection.score << "\n"
+            << "  },\n";
+
+        if (selected_candidate) {
+            out << "  \"selected_candidate\": ";
+            write_candidate_json(out, *selected_candidate, "  ");
+            out << ",\n";
+        }
+
+        out << "  \"candidates\": [\n";
+        for (size_t i = 0; i < tested_candidates.size(); ++i) {
+            write_candidate_json(out, tested_candidates[i], "    ");
+            out << (i + 1 == tested_candidates.size() ? "\n" : ",\n");
+        }
+        out << "  ]\n"
+            << "}\n";
+    }
+
+    {
+        std::ofstream out(report_files.text_path, std::ios::trunc);
+        if (!out) {
+            std::cerr << "[AUTOTUNE] warning: could not write report " << report_files.text_path << "\n";
+            return false;
+        }
+        write_autotune_text_report(out, cfg, key, selection, tested_candidates);
+    }
+
+    return true;
 }
 
 static void save_autotune_cache(
     const MinerConfig &cfg,
     const std::string &key,
-    const AutotuneSelection &selection,
-    const std::vector<AutotuneCandidateResult> &tested_candidates
+    const AutotuneSelection &selection
 ) {
     std::ofstream out(cfg.autotune_cache, std::ios::trunc);
     if (!out) {
@@ -442,26 +810,25 @@ static void save_autotune_cache(
         << "  \"key\": \"" << json_escape(key) << "\",\n"
         << "  \"autotune_seconds\": " << cfg.autotune_seconds << ",\n"
         << "  \"completed_candidates\": " << selection.completed_candidates << ",\n"
+        << "  \"batchsize\": " << selection.batchsize << ",\n"
+        << "  \"requested_batchsize\": " << selection.requested_batchsize << ",\n"
+        << "  \"kernel_mode\": \"" << kernel_mode_name(selection.mode) << "\",\n"
+        << "  \"score\": " << std::fixed << std::setprecision(4) << selection.score << ",\n"
+        << "  \"summary_file\": \"" << json_escape(selection.summary_file) << "\",\n"
+        << "  \"summary_text_file\": \"" << json_escape(selection.summary_text_file) << "\",\n"
+        << "  \"selection_reason\": \"" << json_escape(selection.explanation) << "\",\n"
         << "  \"selected_batchsize\": " << selection.batchsize << ",\n"
         << "  \"selected_requested_batchsize\": " << selection.requested_batchsize << ",\n"
         << "  \"selected_kernel_mode\": \"" << kernel_mode_name(selection.mode) << "\",\n"
         << "  \"selected_trial_elapsed_s\": " << std::fixed << std::setprecision(3) << selection.trial_elapsed_s << ",\n"
         << "  \"selected_intended_trial_seconds\": " << selection.intended_trial_seconds << ",\n"
-        << "  \"score\": " << std::fixed << std::setprecision(4) << selection.score << ",\n"
         << "  \"selected\": {\n"
         << "    \"batchsize\": " << selection.batchsize << ",\n"
         << "    \"requested_batchsize\": " << selection.requested_batchsize << ",\n"
         << "    \"kernel_mode\": \"" << kernel_mode_name(selection.mode) << "\",\n"
-        << "    \"score\": " << std::fixed << std::setprecision(4) << selection.score << "\n"
-        << "  },\n"
-        << "  \"tested_candidates\": [\n";
-
-    for (size_t i = 0; i < tested_candidates.size(); ++i) {
-        write_candidate_json(out, tested_candidates[i], "    ");
-        out << (i + 1 == tested_candidates.size() ? "\n" : ",\n");
-    }
-
-    out << "  ]\n"
+        << "    \"score\": " << std::fixed << std::setprecision(4) << selection.score << ",\n"
+        << "    \"reason\": \"" << json_escape(selection.explanation) << "\"\n"
+        << "  }\n"
         << "}\n";
 }
 
@@ -1012,6 +1379,8 @@ static AutotuneSelection run_launch_autotune(
                       << " requested_batchsize=" << selection.requested_batchsize
                       << " kernel_mode=" << kernel_mode_name(selection.mode)
                       << " score=" << std::fixed << std::setprecision(2) << selection.score
+                      << (selection.summary_file.empty() ? "" : " summary_file=")
+                      << (selection.summary_file.empty() ? "" : selection.summary_file)
                       << "\n";
             return selection;
         }
@@ -1132,6 +1501,7 @@ static AutotuneSelection run_launch_autotune(
 
                 MetricSnapshot before = snapshot_metrics();
                 auto trial_start = std::chrono::steady_clock::now();
+                double trial_max_batch_ms = 0.0;
 
                 while (running.load() && !connection_lost.load() && !shutdown_requested.load()) {
                     auto now = std::chrono::steady_clock::now();
@@ -1141,6 +1511,8 @@ static AutotuneSelection run_launch_autotune(
                     BatchRunStats batch_stats = run_one_mining_batch(trial_hasher, start_nonce_word, true);
                     if (!batch_stats.attempted) {
                         std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    } else {
+                        trial_max_batch_ms = std::max(trial_max_batch_ms, batch_stats.batch_ms);
                     }
                 }
 
@@ -1155,38 +1527,72 @@ static AutotuneSelection run_launch_autotune(
                 uint64_t accepted_delta = after.accepted - before.accepted;
                 uint64_t errors_delta = after.errors - before.errors;
                 uint64_t lowdiff_delta = after.lowdiff - before.lowdiff;
-                uint64_t stale_delta = (after.stale_errors - before.stale_errors) + (after.stale_skipped - before.stale_skipped);
+                uint64_t stale_errors_delta = after.stale_errors - before.stale_errors;
+                uint64_t stale_skipped_delta = after.stale_skipped - before.stale_skipped;
+                uint64_t stale_delta = stale_errors_delta + stale_skipped_delta;
                 uint64_t timed_delta = after.timed_batches - before.timed_batches;
                 uint64_t batch_us_delta = after.batch_us - before.batch_us;
 
                 bool disconnected = connection_lost.load() || (!running.load() && !shutdown_requested.load());
                 double hps = elapsed > 0.0 ? (double)checked_delta / elapsed : 0.0;
-                double accepted_rate = submitted_delta > 0 ? (double)accepted_delta / (double)submitted_delta : 1.0;
-                double error_rate = submitted_delta > 0 ? (double)errors_delta / (double)submitted_delta : 0.0;
+                double accepted_per_sec = elapsed > 0.0 ? (double)accepted_delta / elapsed : 0.0;
+                double submitted_per_sec = elapsed > 0.0 ? (double)submitted_delta / elapsed : 0.0;
+                double acceptance_rate = submitted_delta > 0 ? (double)accepted_delta / (double)submitted_delta : 0.0;
                 double lowdiff_rate = submitted_delta > 0 ? (double)lowdiff_delta / (double)submitted_delta : 0.0;
-                double stale_rate = submitted_delta > 0 ? (double)stale_delta / (double)submitted_delta : 0.0;
+                double stale_denominator = (double)submitted_delta + (double)stale_skipped_delta;
+                double stale_rate = stale_denominator > 0.0 ? (double)stale_delta / stale_denominator : 0.0;
                 double avg_batch_ms = timed_delta > 0 ? ((double)batch_us_delta / (double)timed_delta) / 1000.0 : 0.0;
 
-                double accepted_factor = submitted_delta > 0 ? std::max(0.15, accepted_rate) : 0.85;
-                double error_factor = 1.0 - std::min(0.75, error_rate);
-                double lowdiff_factor = 1.0 - std::min(0.75, lowdiff_rate);
-                double stale_factor = 1.0 - std::min(0.75, stale_rate);
-                double latency_factor = (avg_batch_ms <= 0.0 || avg_batch_ms <= cfg.target_batch_ms)
-                    ? 1.0
-                    : std::max(0.25, cfg.target_batch_ms / avg_batch_ms);
+                uint64_t known_error_delta = lowdiff_delta + stale_errors_delta;
+                uint64_t other_error_delta = errors_delta > known_error_delta ? errors_delta - known_error_delta : 0;
+                double other_error_rate = submitted_delta > 0 ? (double)other_error_delta / (double)submitted_delta : 0.0;
+                double accepted_factor = submitted_delta > 0 ? std::max(0.15, acceptance_rate) : 0.85;
+                double base_score = hps * accepted_factor;
+                double stale_penalty = base_score * std::min(0.75, stale_rate);
+                double lowdiff_penalty = base_score * std::min(0.75, lowdiff_rate);
+                double error_penalty = base_score * std::min(0.75, other_error_rate);
+                double useful_hashrate_score = std::max(0.0, base_score - stale_penalty - lowdiff_penalty - error_penalty);
+                double latency_penalty = 0.0;
+                if (avg_batch_ms > cfg.target_batch_ms && avg_batch_ms > 0.0) {
+                    double latency_penalty_rate = 1.0 - std::max(0.25, cfg.target_batch_ms / avg_batch_ms);
+                    latency_penalty = useful_hashrate_score * std::min(0.75, latency_penalty_rate);
+                }
+                double score = std::max(0.0, useful_hashrate_score - latency_penalty);
 
-                double score = hps * accepted_factor * error_factor * lowdiff_factor * stale_factor * latency_factor;
+                std::vector<std::string> penalty_parts;
+                if (submitted_delta == 0) penalty_parts.push_back("acceptance_assumed_85pct_no_submissions");
+                if (stale_penalty > 0.0) penalty_parts.push_back("stale");
+                if (lowdiff_penalty > 0.0) penalty_parts.push_back("lowdiff");
+                if (error_penalty > 0.0) penalty_parts.push_back("errors");
+                if (latency_penalty > 0.0) penalty_parts.push_back("latency");
 
                 result.disconnected = disconnected;
                 result.elapsed_s = elapsed;
-                result.mhs = hps / 1000000.0;
+                result.hashes_checked = checked_delta;
+                result.hashrate_hs = hps;
+                result.hashrate_mhs = hps / 1000000.0;
                 result.avg_batch_ms = avg_batch_ms;
+                result.max_batch_ms = trial_max_batch_ms;
                 result.submitted = submitted_delta;
                 result.accepted = accepted_delta;
                 result.errors = errors_delta;
-                result.lowdiff = lowdiff_delta;
-                result.stale = stale_delta;
+                result.lowdiff_errors = lowdiff_delta;
+                result.stale_errors = stale_errors_delta;
+                result.stale_skipped = stale_skipped_delta;
+                result.accepted_per_sec = accepted_per_sec;
+                result.submitted_per_sec = submitted_per_sec;
+                result.acceptance_rate = acceptance_rate;
+                result.stale_rate = stale_rate;
+                result.lowdiff_rate = lowdiff_rate;
+                result.base_score = base_score;
+                result.useful_hashrate_score = useful_hashrate_score;
+                result.stale_penalty = stale_penalty;
+                result.lowdiff_penalty = lowdiff_penalty;
+                result.error_penalty = error_penalty;
+                result.latency_penalty = latency_penalty;
+                result.final_score = score;
                 result.score = score;
+                result.penalties_applied = join_reason_parts(penalty_parts);
 
                 if (disconnected) {
                     result.valid = false;
@@ -1229,14 +1635,30 @@ static AutotuneSelection run_launch_autotune(
                           << " reason=" << result.reason
                           << " elapsed_s=" << std::fixed << std::setprecision(1) << elapsed
                           << " required_s=" << std::setprecision(1) << required_trial_seconds
-                          << " mhs=" << std::setprecision(4) << result.mhs
+                          << " hashes_checked=" << checked_delta
+                          << " hashrate_hs=" << std::setprecision(2) << result.hashrate_hs
+                          << " hashrate_mhs=" << std::setprecision(4) << result.hashrate_mhs
                           << " avg_batch_ms=" << std::setprecision(2) << avg_batch_ms
+                          << " max_batch_ms=" << std::setprecision(2) << trial_max_batch_ms
                           << " submitted=" << submitted_delta
                           << " accepted=" << accepted_delta
                           << " errors=" << errors_delta
-                          << " lowdiff=" << lowdiff_delta
-                          << " stale=" << stale_delta
-                          << " score=" << std::setprecision(2) << score
+                          << " lowdiff_errors=" << lowdiff_delta
+                          << " stale_errors=" << stale_errors_delta
+                          << " stale_skipped=" << stale_skipped_delta
+                          << " accepted_per_sec=" << std::setprecision(6) << accepted_per_sec
+                          << " submitted_per_sec=" << std::setprecision(6) << submitted_per_sec
+                          << " acceptance_rate=" << std::setprecision(6) << acceptance_rate
+                          << " stale_rate=" << std::setprecision(6) << stale_rate
+                          << " lowdiff_rate=" << std::setprecision(6) << lowdiff_rate
+                          << " base_score=" << std::setprecision(2) << base_score
+                          << " useful_hashrate_score=" << std::setprecision(2) << useful_hashrate_score
+                          << " stale_penalty=" << std::setprecision(2) << stale_penalty
+                          << " lowdiff_penalty=" << std::setprecision(2) << lowdiff_penalty
+                          << " error_penalty=" << std::setprecision(2) << error_penalty
+                          << " latency_penalty=" << std::setprecision(2) << latency_penalty
+                          << " final_score=" << std::setprecision(2) << score
+                          << " penalties_applied=" << result.penalties_applied
                           << "\n";
 
                 if (disconnected && attempt < max_attempts_per_candidate) {
@@ -1252,13 +1674,22 @@ static AutotuneSelection run_launch_autotune(
     bool enough_completed = completed_candidates >= 2 || single_candidate_full;
     if (selection.valid && enough_completed) {
         selection.completed_candidates = completed_candidates;
+        selection.explanation = explain_autotune_selection(cfg, selection, tested_candidates);
+
+        AutotuneReportFiles report_files;
+        if (write_autotune_report(cfg, cache_key, selection, tested_candidates, report_files)) {
+            selection.summary_file = report_files.json_path;
+            selection.summary_text_file = report_files.text_path;
+        }
+
         std::cout << "[AUTOTUNE] selected batchsize=" << selection.batchsize
                   << " requested_batchsize=" << selection.requested_batchsize
                   << " kernel_mode=" << kernel_mode_name(selection.mode)
                   << " completed_candidates=" << completed_candidates
                   << " score=" << std::fixed << std::setprecision(2) << selection.score
                   << "\n";
-        save_autotune_cache(cfg, cache_key, selection, tested_candidates);
+        print_autotune_summary(selection, tested_candidates, report_files);
+        save_autotune_cache(cfg, cache_key, selection);
         return selection;
     }
 
