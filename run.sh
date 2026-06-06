@@ -34,9 +34,12 @@ set +a
 : "${BATCHSIZE:=32768}"
 : "${AUTOTUNE:=1}"
 : "${AUTOTUNE_SECONDS:=1800}"
+: "${AUTOTUNE_MIN_TRIAL_SECONDS:=60}"
+: "${AUTOTUNE_MIN_TRIAL_RATIO:=0.75}"
 : "${AUTOTUNE_BATCHES:=16384,32768,65536,131072}"
 : "${AUTOTUNE_FORCE:=0}"
 : "${AUTOTUNE_CACHE:=.miner-autotune.json}"
+: "${AUTOTUNE_FAILED_CACHE:=.miner-autotune.failed.json}"
 : "${KERNEL_MODE:=auto}"
 : "${TARGET_BATCH_MS:=1500}"
 : "${AUTO_THRESHOLD:=1}"
@@ -84,8 +87,11 @@ ARGS=(
 if [[ "$AUTOTUNE" == "1" || "$AUTOTUNE" == "true" || "$AUTOTUNE" == "yes" ]]; then
   ARGS+=(--autotune)
   ARGS+=(--autotune-seconds "$AUTOTUNE_SECONDS")
+  ARGS+=(--autotune-min-trial-seconds "$AUTOTUNE_MIN_TRIAL_SECONDS")
+  ARGS+=(--autotune-min-trial-ratio "$AUTOTUNE_MIN_TRIAL_RATIO")
   ARGS+=(--autotune-batches "$AUTOTUNE_BATCHES")
   ARGS+=(--autotune-cache "$AUTOTUNE_CACHE")
+  ARGS+=(--autotune-failed-cache "$AUTOTUNE_FAILED_CACHE")
 else
   ARGS+=(--no-autotune)
 fi

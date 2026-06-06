@@ -23,8 +23,11 @@ void print_usage(const char *argv0) {
         << "  --no-autotune               Disable launch autotune\n"
         << "  --autotune-force            Ignore cached autotune result\n"
         << "  --autotune-seconds <n>      Total autotune budget, default 1800\n"
+        << "  --autotune-min-trial-seconds <n> Minimum valid trial duration\n"
+        << "  --autotune-min-trial-ratio <n> Minimum valid trial ratio\n"
         << "  --autotune-batches <list>   Comma-separated batch sizes\n"
         << "  --autotune-cache <path>     Autotune cache path\n"
+        << "  --autotune-failed-cache <path> Partial/failed autotune output path\n"
         << "  --target-batch-ms <ms>      Preferred max batch latency\n"
         << "  --auto-threshold            Increase submit margin after lowdiff rejects\n"
         << "  --no-auto-threshold         Disable adaptive submit threshold\n"
@@ -86,10 +89,16 @@ bool parse_args(int argc, char **argv, MinerConfig &cfg) {
             cfg.autotune_force = true;
         } else if (a == "--autotune-seconds" && i + 1 < argc) {
             cfg.autotune_seconds = std::atoi(argv[++i]);
+        } else if (a == "--autotune-min-trial-seconds" && i + 1 < argc) {
+            cfg.autotune_min_trial_seconds = std::atoi(argv[++i]);
+        } else if (a == "--autotune-min-trial-ratio" && i + 1 < argc) {
+            cfg.autotune_min_trial_ratio = std::atof(argv[++i]);
         } else if (a == "--autotune-batches" && i + 1 < argc) {
             cfg.autotune_batches = argv[++i];
         } else if (a == "--autotune-cache" && i + 1 < argc) {
             cfg.autotune_cache = argv[++i];
+        } else if (a == "--autotune-failed-cache" && i + 1 < argc) {
+            cfg.autotune_failed_cache = argv[++i];
         } else if (a == "--target-batch-ms" && i + 1 < argc) {
             cfg.target_batch_ms = std::atof(argv[++i]);
         } else if (a == "--auto-threshold") {

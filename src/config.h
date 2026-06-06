@@ -22,8 +22,11 @@ struct MinerConfig {
     bool autotune = false;
     bool autotune_force = false;
     int autotune_seconds = 1800;
+    int autotune_min_trial_seconds = 60;
+    double autotune_min_trial_ratio = 0.75;
     std::string autotune_batches = "16384,32768,65536,131072";
     std::string autotune_cache = ".miner-autotune.json";
+    std::string autotune_failed_cache = ".miner-autotune.failed.json";
     double target_batch_ms = 1500.0;
     bool auto_threshold = true;
 };

@@ -67,9 +67,12 @@ BATCHSIZE=32768
 
 AUTOTUNE=1
 AUTOTUNE_SECONDS=1800
-AUTOTUNE_BATCHES=16384,32768,49152,65536
+AUTOTUNE_MIN_TRIAL_SECONDS=60
+AUTOTUNE_MIN_TRIAL_RATIO=0.75
+AUTOTUNE_BATCHES=16384,32768,65536,131072
 AUTOTUNE_FORCE=0
 AUTOTUNE_CACHE=.miner-autotune.json
+AUTOTUNE_FAILED_CACHE=.miner-autotune.failed.json
 KERNEL_MODE=auto
 TARGET_BATCH_MS=1500
 AUTO_THRESHOLD=1
@@ -89,9 +92,12 @@ AUTO_THRESHOLD=1
 | `BATCHSIZE` | GPU nonces scanned per batch when autotune is disabled or uncached |
 | `AUTOTUNE` | Enable launch optimisation and local cache |
 | `AUTOTUNE_SECONDS` | Total first-run autotune budget |
+| `AUTOTUNE_MIN_TRIAL_SECONDS` | Minimum trial duration before a candidate can be valid |
+| `AUTOTUNE_MIN_TRIAL_RATIO` | Minimum fraction of the intended trial duration before a candidate can be valid |
 | `AUTOTUNE_BATCHES` | Comma-separated batch sizes to test |
 | `AUTOTUNE_FORCE` | Ignore cached autotune result and retune |
 | `AUTOTUNE_CACHE` | Local autotune cache path |
+| `AUTOTUNE_FAILED_CACHE` | Local failed/partial autotune debug output |
 | `KERNEL_MODE` | `split`, `combo`, or `auto` |
 | `TARGET_BATCH_MS` | Preferred maximum batch latency for stale-share control |
 | `AUTO_THRESHOLD` | Increase submit margin after low-difficulty rejects |
@@ -110,6 +116,8 @@ Recommended `.env` tuning:
 ```bash
 AUTOTUNE=1
 AUTOTUNE_SECONDS=1800
+AUTOTUNE_MIN_TRIAL_SECONDS=60
+AUTOTUNE_MIN_TRIAL_RATIO=0.75
 AUTOTUNE_BATCHES=16384,32768,49152,65536
 KERNEL_MODE=auto
 TARGET_BATCH_MS=1500
@@ -124,7 +132,9 @@ After the first successful tune, set `AUTOTUNE_FORCE=0` so the miner reuses `.mi
 
 With `AUTOTUNE=1`, the miner tests configured batch sizes and split/combo kernel modes on launch. It scores candidates by hashrate, accepted share rate, rejects, stale work, and batch latency.
 
-The winning result is written to `.miner-autotune.json`. That file is ignored by git and reused on later starts unless `AUTOTUNE_FORCE=1` is set.
+The winning result is written to `.miner-autotune.json` only after meaningful completed trials. If the pool disconnects during autotune, the current candidate is marked failed, the miner reconnects and retries, and partial results are written to `.miner-autotune.failed.json` for debugging instead of being reused.
+
+The cache is ignored unless it is marked `valid`, matches the current GPU/config key, was derived from the configured `AUTOTUNE_BATCHES`, and completed enough candidate testing. Later starts reuse the valid cache unless `AUTOTUNE_FORCE=1` is set.
 
 The goal is not just maximum displayed MH/s. The goal is the best accepted-share rate with batch latency low enough to avoid unnecessary stale work.
 

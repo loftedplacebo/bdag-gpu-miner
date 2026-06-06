@@ -2,6 +2,7 @@
 .env
 vast_instances.json
 .miner-autotune.json
+.miner-autotune.failed.json
 
 # Build artefacts
 *.o
